@@ -1,0 +1,53 @@
+# fbm-gpu test on PoCL 5.0 (CPU OpenCL, 4 vCPU Cascade Lake), 1e3a346
+device: cpu-skylake-avx512-Intel(R) Xeon(R) Processor @ 2.80GHz
+GPU kernels vs reference, default launch sizes
+  loose (~1/16)                          8163 candidates
+  tight (~1/4096)                        186 candidates
+  nearly all                             1024 candidates
+  odd sizes                              53 candidates
+  end of nonce and version spaces        439 candidates
+  production t7=0                        0 candidates
+  many versions, not a group multiple    1154 candidates
+GPU kernels vs reference, tiny launches (1000 hashes, 3 and 7 nonces per work-item)
+  loose (~1/16)                          8118 candidates
+  tight (~1/4096)                        179 candidates
+  nearly all                             1024 candidates
+  odd sizes                              50 candidates
+  end of nonce and version spaces        418 candidates
+  production t7=0                        0 candidates
+  many versions, not a group multiple    1119 candidates
+GPU kernels rediscover real (version, nonce) of 9 mainnet blocks
+planted answers at production geometry (last version index, last nonce)
+  nonce genesis: 1 versions x 1494332 nonces, answer found: yes
+  vr    800000: 65536 versions x 64 nonces, answer found: yes
+candidate overflow is counted
+the mining canary detects a faulty device
+baseline poclbm rediscovers the real nonce of 9 mainnet blocks
+all GPU tests passed
+
+# the same, dist/fbm-gpu.exe under Wine 9.0 (opencl.dll -> PoCL)
+device: cpu-skylake-avx512-Intel(R) Xeon(R) Processor @ 2.80GHz
+GPU kernels vs reference, default launch sizes
+  loose (~1/16)                          8163 candidates
+  tight (~1/4096)                        186 candidates
+  nearly all                             1024 candidates
+  odd sizes                              53 candidates
+  end of nonce and version spaces        439 candidates
+  production t7=0                        0 candidates
+  many versions, not a group multiple    1154 candidates
+GPU kernels vs reference, tiny launches (1000 hashes, 3 and 7 nonces per work-item)
+  loose (~1/16)                          8118 candidates
+  tight (~1/4096)                        179 candidates
+  nearly all                             1024 candidates
+  odd sizes                              50 candidates
+  end of nonce and version spaces        418 candidates
+  production t7=0                        0 candidates
+  many versions, not a group multiple    1119 candidates
+GPU kernels rediscover real (version, nonce) of 9 mainnet blocks
+planted answers at production geometry (last version index, last nonce)
+  nonce genesis: 1 versions x 1287647 nonces, answer found: yes
+  vr    800000: 65536 versions x 64 nonces, answer found: yes
+candidate overflow is counted
+the mining canary detects a faulty device
+baseline poclbm rediscovers the real nonce of 9 mainnet blocks
+all GPU tests passed

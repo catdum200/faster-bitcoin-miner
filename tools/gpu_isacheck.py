@@ -265,6 +265,8 @@ def check_probes(clang, objdump, mcpu):
     asm, _ = compile_cl(clang, objdump, text, mcpu, [])
     funcs, ok, bad = parse(asm), True, []
     for name, (want, extra, n_extra) in PROBES.items():
+        if extra == 's_delay_alu' and not mcpu.startswith(('gfx11', 'gfx12')):
+            n_extra = 0  # s_delay_alu exists only on RDNA3 and later
         ins = funcs.get(name, [])
         loop = main_loop(ins) if ins else None
         ops = collections.Counter(op.split('_e32')[0].split('_e64')[0] for addr, op, size, tgt in ins

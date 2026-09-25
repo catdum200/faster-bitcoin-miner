@@ -1,0 +1,28 @@
+clang-20, -mcpu=gfx1200, work-group 64
+
+per hash = per loop iteration of one lane. GH/s = 2048 lanes x 2.53-3.13 GHz / instructions,
+counting VALU only, or every instruction as one issue slot (pessimistic).
+
+| kernel | VALU/hash | vs generator | 96-bit VALU | SALU | SMEM | VMEM | wait/delay | all instr. | candidate-only | bytes | VGPRs | scratch | waves/SIMD | GH/s (VALU) | GH/s (all) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| fbm_nonce | 2580 | +1.0% | 125 | 7 | 0 | 0 | 101 | 2688 | 28 | 19720 | 43 | 0 | 16 | 2.01-2.48 | 1.93-2.38 |
+|  | v_alignbit_b32 1020, v_add3_u32 406, v_xor3_b32 315, v_bfi_b32 215, v_xor_b32_e32 212, v_lshrrev_b32_e32 156, v_add_nc_u32_e32 136, v_xad_u32 95, v_and_b32_e32 21 | | | | | | | | | | | | | | |
+| fbm_vr | 2196 | +1.0% | 77 | 16 | 5 | 0 | 228 | 2445 | 29 | 17332 | 67 | 0 | 16 | 2.36-2.92 | 2.12-2.62 |
+|  | v_alignbit_b32 868, v_add3_u32 326, v_xor3_b32 278, v_bfi_b32 215, v_add_nc_u32_e32 178, v_xor_b32_e32 172, v_lshrrev_b32_e32 80, v_xad_u32 56, v_and_b32_e32 21 | | | | | | | | | | | | | | |
+
+vr vs nonce: 1.175x fewer VALU; 1.099x if every instruction takes an issue slot
+
+issue-rate probes: each loop is 64 of its instruction
+
+Prior art, cgminer 3.7.2 (one nonce per work-item; the whole kernel):
+
+| kernel | VALU/hash | vs generator | 96-bit VALU | SALU | SMEM | VMEM | wait/delay | all instr. | candidate-only | bytes | VGPRs | scratch | waves/SIMD | GH/s (VALU) | GH/s (all) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| poclbm130302 | 2578 | - | 122 | 112 | 3 | 0 | 214 | 2907 | 8 | 20480 | 40 | 0 | 16 | 2.01-2.49 | 1.78-2.21 |
+| phatk121016 | 2575 | - | 122 | 123 | 3 | 0 | 198 | 2899 | 8 | 20480 | 40 | 0 | 16 | 2.01-2.49 | 1.79-2.21 |
+| diakgcn121016 | 2572 | - | 116 | 120 | 4 | 0 | 155 | 2851 | 8 | 20224 | 40 | 0 | 16 | 2.01-2.49 | 1.82-2.25 |
+| diablo130302 | 2574 | - | 121 | 108 | 3 | 0 | 127 | 2812 | 8 | 20096 | 41 | 0 | 16 | 2.01-2.49 | 1.84-2.28 |
+
+vr vs the best of them: 1.171x fewer VALU (vs diakgcn121016); 1.150x fewer instructions if every one takes an issue slot (vs diablo130302)
+
+ok

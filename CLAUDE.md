@@ -13,7 +13,10 @@ mine bitcoin?". The answer, with evidence, is in `README.md` and
 - The best software gain found is version rolling in SIMD lanes: 1.21x over
   cpuminer-opt, the best existing open-source CPU sha256d code.
 - CPU/GPU mining is economically pointless: ~$0.002/year on this 4-core VM,
-  ~$0.04/year estimated for an RX 9060 XT.
+  ~$0.03-0.04/year estimated for an RX 9060 XT.
+- On the GPU (RX 9060 XT, RDNA4/gfx1200) the same trick gives 1.15-1.17x fewer
+  instructions per hash than cgminer's 2013 kernels (`docs/GPU_RESULTS.md`).
+  That figure is **static**: no GPU was ever available here.
 
 ## Commands
 
@@ -37,6 +40,15 @@ python3 tools/economics.py --mhs N --watts W [--usd-per-kwh P] [--rent-usd-per-h
 bench/run_all.sh     # regenerates bench/results/* (the source of every number in
                      # docs/RESULTS.md); ~12 min, needs an otherwise idle machine
 bench/cpuminer/build.sh  # separate harness for pooler/cpuminer's AVX2 assembly
+
+make gpu             # ./fbm-gpu (OpenCL loaded at run time; builds with no SDK)
+./fbm-gpu test       # GPU suite (~15 s on PoCL, the installed CPU OpenCL)
+./fbm-gpu bench|mine|probe|sustain|report|dump|info|list   (see usage)
+make gpu-check       # tools/gpu_isacheck.py: gfx1200 audit via clang-20 (+ cgminer if fetched)
+bench/gpu-baselines/fetch.sh  # cgminer 3.7.2 kernels (not vendored) for audit/bench
+make gpu-win         # dist-style fbm-gpu.exe via mingw-w64; test with
+                     # WINEDEBUG=-all wine fbm-gpu.exe test  (Wine's opencl.dll -> PoCL)
+make gpu-codeobj     # build/fbm-gfx1200.co, run with fbm-gpu --program (ROCm only)
 ```
 
 ## Architecture
@@ -109,6 +121,42 @@ compiled loops against.
   multiple of 64 nonces) and pins it. Candidates beyond the buffer capacity
   are counted in `out->n > out->cap`, never silently dropped.
 
+**GPU (`gpu/`, `src/gpu*.c`).**
+
+- **One generator.** `gen_kernels.py` has an `rdna` target: ternary add
+  trees (`v_add3_u32`), Ch = `v_bfi_b32`, Maj = bfi(b ^ c, a, c). Its output
+  (`src/gen/g_rdna_*.h`) is plain C that is also valid OpenCL C:
+  `gpu/prelude.cl` maps the macros, and `src/rdna_scalar.h` runs the same
+  code on the CPU.
+  - `rdna-emu` / `rdna-emu-vr` in `fbm` put that code through every CPU test.
+  - The ternary trees exist so that the generator's count predicts the
+    compiled loop (+1%). Binary trees compile 2 VALU better (0.08%).
+- **Two kernels** (`gpu/kernels.cl`):
+  - `fbm_nonce`: nonces in lanes, the prior-art layout.
+  - `fbm_vr`: rolled versions in lanes. The `fbm_vr_sched` pre-pass writes
+    each nonce's 47 NONCE words (block-2 schedule + K) to a table, and the
+    loop reads the row with uniform loads, which become `s_load` into SGPRs.
+    LANE values (19 per version) are computed on the host once per job and
+    held in VGPRs.
+- **Where uniform work must not go.** Portable OpenCL puts wave-uniform
+  rotates on the VALU (the SALU has no rotate), so computing the schedule
+  inline loses (0.96x).
+- **Host (`src/gpu.c`).**
+  - Launches are adaptive, 8 ms by default (desktop-safe), sized from the
+    measured rate.
+  - The lane table is cached per job.
+  - Hits go through an atomic counter; overflow is counted.
+  - The cgminer poclbm baseline takes a clean-room 26-argument precompute
+    (`poclbm_args`) and iterates W3 = bswap(nonce).
+- **CLI and audit.**
+  - `fbm-gpu mine` runs a known-answer canary at start and every minute.
+  - `report` is the single artifact the card's owner sends back.
+  - `tools/gpu_isacheck.py` finds each hot loop (the largest backward
+    branch), splits candidate-only code (`s_cbranch_execz`) from the rest,
+    and checks: ±2% of the generator, no scratch, ≥ 4 waves, no VMEM and
+    ≤ 8 SMEM in the vr loop, a loop under 32 KB, and exactly 64 instructions
+    per probe loop.
+
 **Tests (`src/selftest.c`).** The oracle is the portable reference SHA-256 in
 `src/sha256.c`, itself checked against the FIPS vectors and against OpenSSL.
 Every supported kernel, the baselines included, must:
@@ -130,15 +178,24 @@ Every supported kernel, the baselines included, must:
   slower) and puts `mov $imm; vpbroadcastd r32` pairs in the AVX-512 hot
   loops; `make check` flags both.
 - **Generated code.** After editing `gen/gen_kernels.py`, run `make gen` and
-  then `make check`. Never edit `src/gen/*.h` by hand.
+  then `make check`; for the GPU also `make gpu-check` and `./fbm-gpu test`.
+  Never edit `src/gen/*.h` by hand.
+- **GPU claims.** Nothing has run on a real GPU.
+  - Static claims come from `gpu_isacheck.py` counts (VALU, and the
+    pessimistic "all instructions" count).
+  - Speed, power and J/TH exist only once `fbm-gpu report` output from a
+    real card is in `bench/results/`. Never present PoCL timings as GPU
+    numbers.
+- **`dist/fbm-gpu.exe`.** Rebuild it with `make gpu-win` after GPU source
+  changes, and update the commit and SHA-256 in `dist/README.md`.
 
 ## Progress (as of 2026-09-25)
 
 **Process so far:** `docs/PLAN_v1.md`, then `docs/CRITIQUE.md` (an
 independent adversarial review), then `docs/PLAN.md` (every finding mapped
 to a change), then the implementation, then `docs/RESULTS.md`, whose numbers
-come from `bench/results/`. The work is on branch
-`claude/exciting-euler-zgd58e`.
+come from `bench/results/`. The GPU work repeated this as `docs/GPU_*.md`.
+The work is on branch `claude/exciting-euler-zgd58e`.
 
 **Measured on a 4-vCPU Cascade Lake VM** (AVX-512, no SHA-NI, no GPU):
 
@@ -164,11 +221,19 @@ come from `bench/results/`. The work is on branch
   is the next step for AVX2-only CPUs.
 - **`avx512vl-vr` is 3-5% slower than `avx512vl`** despite fewer
   instructions. The cause is unknown; this VM has no hardware counters.
+- **GPU numbers wait on the card's owner.** Static counts on gfx1200:
+  - `fbm_vr` 2196 VALU/hash (2445 counting every instruction);
+  - `fbm_nonce` 2580 (2688);
+  - cgminer 2572-2578 (2812-2907).
+
+  Unknown until `fbm-gpu report` runs on an RX 9060 XT:
+  - full-rate issue of the integer ops;
+  - whether SALU and `s_delay_alu` cost issue slots (1.17x vs 1.15x);
+  - the sustained clock and power;
+  - the driver's own ISA.
 - **Not implemented:**
   - a SHA-NI kernel (untestable here);
-  - a Stratum/pool client (version rolling would also need BIP 310);
-  - a GPU kernel. An RX 9060 XT is estimated at ~3 GH/s from published
-    hashcat data; see the README.
+  - a Stratum/pool client (version rolling would also need BIP 310).
 
 ## Environment gotchas
 
@@ -184,3 +249,13 @@ come from `bench/results/`. The work is on branch
 - **Network.** mempool.space and public GitHub clones work. Some benchmark
   sites return 403 to WebFetch; `curl` of OpenBenchmarking's
   `&export=csv` works.
+- **GPU tooling here.** Most of it is in apt (Ubuntu 24.04):
+  - PoCL (`pocl-opencl-icd`) is the only OpenCL device;
+  - clang-20 and llvm-20 provide the AMDGPU audit (clang 18 gives identical
+    counts);
+  - mingw-w64 and Wine build and test the `.exe`.
+
+  The RDNA4 ISA guide PDF downloads from docs.amd.com (amd.com's own URL
+  fails); `pdftotext` it.
+- **`s_delay_alu` is RDNA3+ only.** Guard inline asm with `__GFX11__` or
+  `__GFX12__`, or the whole program fails to build on RDNA2.

@@ -1,0 +1,16 @@
+Network (live mempool.space): height 968579, hashrate 9.24e+20 H/s, difficulty 1.328e+14, BTC $84007, reward 3.1516 BTC/block (subsidy 3.125 + fees 0.0266)
+
+| quantity                                | value |
+|-----------------------------------------|---|
+| This miner                              | 2300.0 MH/s |
+| Share of network hashrate               | 2.5e-12 |
+| Expected revenue                        | 1.1e-09 BTC/day = $0.0337 per year |
+| Expected time to find a block solo      | 7.86e+06 years |
+| Chance of a block within a year         | 1.3e-07 |
+| Energy efficiency (at 160 W, estimated) | 6.96e+04 J/TH |
+| Antminer S21 XP (spec)                  | 13.5 J/TH, 270 TH/s |
+| Energy per hash vs that ASIC            | 5.2e+03x worse |
+| Electricity at $0.15/kWh                | $210.24 per year |
+| Revenue / electricity cost              | 0.00016 |
+| ASIC revenue for comparison             | 0.000129 BTC/day = $3954 per year per machine |
+| ASIC electricity at $0.15/kWh           | $4790 per year per machine |

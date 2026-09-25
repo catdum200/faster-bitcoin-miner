@@ -23,7 +23,11 @@
 #define V_BFI(x, y) A3("v_bfi_b32 %0, %0, %1, %2", x, y)
 #define V_XAD(x, y) A3("v_xad_u32 %0, %0, %1, %2", x, y)
 #define S_XOR(s, t) __asm__ volatile("s_xor_b32 %0, %0, %1" : "+s"(s) : "s"(t))
+#if defined(__GFX11__) || defined(__GFX12__) /* s_delay_alu is RDNA3+ only */
 #define S_DELAY() __asm__ volatile("s_delay_alu 0")
+#else
+#define S_DELAY()
+#endif
 #else
 #define V_ADD(x, y) (x) = (x) + (y)
 #define V_ALIGNBIT(x, y) (x) = ((x) << 25) | ((y) >> 7)

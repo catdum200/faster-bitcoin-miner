@@ -30,31 +30,46 @@ The full numbers and the method are in [`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## What about a home GPU? (e.g. Radeon RX 9060 XT 16 GB)
 
-Still a bad idea for bitcoin. A GPU is far faster than this CPU but still
-thousands of times less efficient than an ASIC:
+Still a bad idea for bitcoin. But this repository now has a GPU miner for
+that card: `fbm-gpu` (OpenCL). Its kernel does **1.15-1.17x less work per
+hash than the best open-source GPU kernels** (cgminer, 2013), by rolling
+BIP 320 versions across GPU lanes. See [`docs/GPU_RESULTS.md`](docs/GPU_RESULTS.md).
 
-- **Hash rate.** A published hashcat run on the RX 9060 XT (ROCm OpenCL, June
-  2025) measured 12.78 GH/s SHA-1 and 1.40 GH/s SHA-512, at ~89 W on the GPU
-  sensor. An RX 6800 XT measured on all three algorithms runs SHA-256 at
-  0.424x its SHA-1 rate and 3.73x its SHA-512 rate. Applying those ratios
-  gives **~5.2-5.4 GH/s of single SHA-256**. Mining costs ~1.5-1.8 SHA-256
-  compressions per attempt even with every trick here, so that is **~3 GH/s
-  of bitcoin mining**, ~24x this 4-core CPU. This is an estimate; no GPU was
-  available to test on.
-- **Money.** `python3 tools/economics.py --mhs 3000 --watts 90 --usd-per-kwh
-  0.15 --rent-usd-per-hour 0` gives about **$0.04 of expected revenue per
-  year**, against **$118-210 per year** of electricity for the card alone (90 W
-  measured, 160 W rated), before the rest of the PC.
-- **Solo odds.** About one block per **6 million years**, a ~1 in 6 million
-  chance per year.
-- **Energy.** ~30,000-53,000 J/TH, **2,000-4,000x worse** than an Antminer S21
-  XP (13.5 J/TH).
-- **Better code does not change this.** A perfect GPU kernel with version
-  rolling would add perhaps 15-20%, i.e. about a cent more per year.
+- **The gain is static.** No GPU was available: the kernels were compiled for
+  the card's ISA (gfx1200) and every instruction in the hot loop was counted.
+  The same was done for cgminer's kernels. Nothing was timed on the card.
+- **What was tested.** The kernels and host pass the correctness suite on a
+  CPU OpenCL (PoCL). The Windows build passes it under Wine.
+- **Hash rate.** ~2-3 GH/s. This is a compile-based estimate, unmeasured:
+  2.1-2.9 GH/s for the version-rolling kernel, 1.8-2.5 for prior art, at the
+  card's 2.5-3.1 GHz. A published hashcat run fits it: 12.78 GH/s SHA-1 and
+  1.40 GH/s SHA-512 on this card suggest ~5 GH/s of single SHA-256, and mining
+  costs almost two SHA-256 compressions per attempt.
+- **Money.** At 2.3 GH/s, `python3 tools/economics.py --mhs 2300 --watts 160
+  --usd-per-kwh 0.15 --rent-usd-per-hour 0` gives **$0.034 of expected revenue
+  per year** against **$210 per year** of electricity for the card alone.
+- **Solo odds.** About one block per **8 million years**.
+- **Energy.** **2,000-6,000x worse per hash** than an Antminer S21 XP
+  (13.5 J/TH).
+- **Better code does not change this.** The 1.17x kernel moves revenue from
+  about three cents a year to about four. Lowering the power limit is a
+  bigger efficiency lever than any kernel, and it does not change the
+  verdict either.
+
+**To measure it on your card:** on Windows run
+`dist\fbm-gpu.exe report` (see [`dist/README.md`](dist/README.md)); on
+Linux, `make gpu && ./fbm-gpu report`. It writes one file with:
+
+- the tests on the real GPU;
+- per-instruction issue rates;
+- an interleaved speed comparison against cgminer's kernel;
+- sustained runs, logging power on Linux;
+- the driver-compiled binary.
 
 Sources: [RX 9060 XT hashcat results (OpenBenchmarking)](https://openbenchmarking.org/result/2506064-PTS-NEWGPUCO48),
 [RX 6800 XT hashcat benchmarks](https://gist.github.com/epixoip/99085955a1145ff61ec83512a50421a7),
-[RX 9060 XT specs, Tom's Hardware](https://www.tomshardware.com/pc-components/gpus/amd-radeon-rx-9060-xt-16gb-review/7).
+[RX 9060 XT specs, Tom's Hardware](https://www.tomshardware.com/pc-components/gpus/amd-radeon-rx-9060-xt-16gb-review/7),
+[RDNA4 ISA guide (AMD)](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf).
 
 ## How it was built: plan, critique, revise
 
@@ -72,6 +87,10 @@ Sources: [RX 9060 XT hashcat results (OpenBenchmarking)](https://openbenchmarkin
    where the critique was right. For example, version rolling is a net
    *loss* when only 16 versions share each nonce's schedule, and needs about
    128 to reach its full +15%.
+
+The GPU kernel went through the same process:
+[`GPU_PLAN_v1`](docs/GPU_PLAN_v1.md) → [`GPU_CRITIQUE`](docs/GPU_CRITIQUE.md)
+→ [`GPU_PLAN`](docs/GPU_PLAN.md) → [`GPU_RESULTS`](docs/GPU_RESULTS.md).
 
 ## How it works
 
@@ -116,6 +135,15 @@ make asan tsan       # the tests under Address/UB/Thread sanitizers
 ./fbm bench --threads 4 --rounds 20
 ./fbm mine --header <160 hex chars> [--start N --count N --versions N --threads N]
 python3 tools/economics.py --mhs 124.7 --watts 30  # live network numbers
+
+make gpu             # builds ./fbm-gpu (OpenCL, loaded at run time; no SDK needed)
+./fbm-gpu list       # OpenCL devices
+./fbm-gpu test       # GPU kernels vs the reference (any OpenCL device, PoCL included)
+./fbm-gpu bench      # interleaved: cgminer's poclbm vs nonce-lane vs version-lane kernel
+./fbm-gpu mine --header <160 hex> --versions 65536 [--seconds S]
+./fbm-gpu report     # everything, in one file to send back (run on the real card)
+make gpu-check       # gfx1200 ISA audit (needs clang >= 18 with AMDGPU)
+make gpu-win         # Windows build (mingw-w64); prebuilt: dist/fbm-gpu.exe
 ```
 
 `make BASELINES=1` also fetches [cpuminer-opt](https://github.com/JayDDee/cpuminer-opt)
@@ -161,10 +189,14 @@ src/kern_template.h    the two kernel layouts around the generated code
 src/kernel_*.c         per-ISA instantiations; ref/OpenSSL baselines; cpuminer-opt wrapper
 src/miner.c            multithreaded driver (pinned threads, contiguous nonce slices)
 src/main.c             CLI: test, list, freq, bench (interleaved, bootstrap CIs), mine
+gpu/                   OpenCL kernels (around the generated rdna code) and issue-rate probes
+src/gpu*.c, clload.c   fbm-gpu: OpenCL driver, tests, bench, mine, report
+tools/gpu_isacheck.py  audits the kernels compiled for gfx1200 (make gpu-check)
+dist/fbm-gpu.exe       prebuilt Windows fbm-gpu
 tools/asmcheck.py      audits the compiled hot loops (make check)
 tools/economics.py     revenue/energy from live mempool.space data
 bench/                 baseline fetch/build scripts, run_all.sh, results/
-docs/                  PLAN_v1 -> CRITIQUE -> PLAN -> RESULTS
+docs/                  PLAN_v1 -> CRITIQUE -> PLAN -> RESULTS, and the same for GPU_*
 ```
 
 ## Limitations and next steps
