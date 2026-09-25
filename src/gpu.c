@@ -52,6 +52,8 @@ struct fbm_gpu {
     cl_event *ev;
     size_t nev, cap_ev;
     double ksec;
+    double rate[2]; /* H/s of kernel time per layout, for launch sizing */
+    int measured[2];
     char name[256];
 };
 
@@ -61,10 +63,12 @@ void fbm_gpu_default_opts(fbm_gpu_opts *o)
     o->device = -1;
     o->wg = 64;
     o->nonce_iters = 16;
-    o->vr_iters = 128;
-    o->launch_hashes = 268435456.0; /* 2^28: ~0.1 s at 2-3 GH/s */
+    o->vr_iters = 64;
+    o->launch_ms = 8;
+    o->launch_hashes = 0;
     o->hit_cap = 1u << 20;
     o->build_opts = "";
+    o->inject_fault = 0;
 }
 
 static cl_uint platforms(cl_platform_id *p, cl_uint max)
@@ -162,6 +166,13 @@ fbm_gpu *fbm_gpu_open(const fbm_gpu_opts *o)
         return NULL;
     }
     clGetDeviceInfo(g->dev, CL_DEVICE_NAME, sizeof g->name, g->name, NULL);
+    /* Until the first scan measures it, model the rate as 64 lanes per
+     * compute unit at the maximum clock and ~2600 instructions per hash (an
+     * RX 9060 XT comes out at ~2.5 GH/s). */
+    cl_uint cu = 1, mhz = 1000;
+    clGetDeviceInfo(g->dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof cu, &cu, NULL);
+    clGetDeviceInfo(g->dev, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof mhz, &mhz, NULL);
+    g->rate[0] = g->rate[1] = 64.0 * cu * mhz * 1e6 / 2600;
     g->ctx = clCreateContext(NULL, 1, &g->dev, NULL, NULL, &err);
     CL_OK(err);
     g->q = clCreateCommandQueue(g->ctx, g->dev, CL_QUEUE_PROFILING_ENABLE, &err);
@@ -239,6 +250,19 @@ const char *fbm_gpu_name(const fbm_gpu *g)
 fbm_gpu_opts *fbm_gpu_options(fbm_gpu *g)
 {
     return &g->o;
+}
+
+double fbm_gpu_rate(const fbm_gpu *g, fbm_gpu_layout layout)
+{
+    return g->rate[layout];
+}
+
+/* Hashes per launch: fixed (tests) or launch_ms at the estimated rate. */
+static double launch_size(const fbm_gpu *g, fbm_gpu_layout layout)
+{
+    if (g->o.launch_hashes > 0)
+        return g->o.launch_hashes;
+    return g->rate[layout] * g->o.launch_ms * 1e-3;
 }
 
 double fbm_gpu_kernel_seconds(const fbm_gpu *g)
@@ -337,6 +361,8 @@ static void write_job(fbm_gpu *g, const uint32_t *J, size_t nj, uint32_t t7)
     uint32_t w[JOB_WORDS] = {0};
     memcpy(w, J, nj * 4);
     w[JOB_T7] = t7;
+    if (g->o.inject_fault)
+        w[0] ^= 1u << 7;
     CL_OK(clEnqueueWriteBuffer(g->q, g->job, CL_TRUE, 0, sizeof w, w, 0, NULL, NULL));
 }
 
@@ -349,8 +375,10 @@ static void reset_hits(fbm_gpu *g)
 }
 
 /* Waits for the queue, sums kernel time, and reads the hit list. Each hit is
- * (index, nonce); map(index) gives the version to report. */
-static void collect(fbm_gpu *g, fbm_hits *out, uint32_t base, uint32_t r_off)
+ * (index, nonce); map(index) gives the version to report. Scans of at least
+ * `hashes` update the layout's rate estimate. */
+static void collect(fbm_gpu *g, fbm_gpu_layout layout, double hashes, fbm_hits *out,
+                    uint32_t base, uint32_t r_off)
 {
     CL_OK(clFinish(g->q));
     g->ksec = 0;
@@ -362,6 +390,12 @@ static void collect(fbm_gpu *g, fbm_hits *out, uint32_t base, uint32_t r_off)
         clReleaseEvent(g->ev[i]);
     }
     g->nev = 0;
+    /* Tiny scans are dominated by launch overhead; do not learn from them. */
+    if (g->ksec > 2e-3 && hashes > 0) {
+        const double r = hashes / g->ksec;
+        g->rate[layout] = g->measured[layout] ? 0.5 * g->rate[layout] + 0.5 * r : r;
+        g->measured[layout] = 1;
+    }
 
     uint32_t *h = g->host_hits;
     CL_OK(clEnqueueReadBuffer(g->q, g->hits, CL_TRUE, 0, 8, h, 0, NULL, NULL));
@@ -380,7 +414,7 @@ static uint64_t scan_nonce(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t
 {
     const uint32_t base = fbm_header_get(job->header, FBM_OFF_VERSION);
     const uint64_t per_group = (uint64_t)g->o.wg * g->o.nonce_iters;
-    uint64_t per_launch = (uint64_t)(g->o.launch_hashes / per_group) * per_group;
+    uint64_t per_launch = (uint64_t)(launch_size(g, FBM_GPU_NONCE) / per_group) * per_group;
 
     if (per_launch < per_group)
         per_launch = per_group;
@@ -405,7 +439,7 @@ static uint64_t scan_nonce(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t
             launch(g, g->k_nonce, 1, &global, &local);
         }
     }
-    collect(g, out, base, r0);
+    collect(g, FBM_GPU_NONCE, (double)nr * nn, out, base, r0);
     return (uint64_t)nr * nn;
 }
 
@@ -453,7 +487,7 @@ static uint64_t scan_vr(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t nr
     }
     reset_hits(g);
 
-    uint64_t per_launch = (uint64_t)(g->o.launch_hashes / (double)nrp);
+    uint64_t per_launch = (uint64_t)(launch_size(g, FBM_GPU_VR) / (double)nrp);
     if (per_launch < 1)
         per_launch = 1;
     if (per_launch > SCHED_ROWS)
@@ -480,7 +514,7 @@ static uint64_t scan_vr(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t nr
         set_mem(g->k_vr, 8, g->hits);
         launch(g, g->k_vr, 2, global, local);
     }
-    collect(g, out, base, r0);
+    collect(g, FBM_GPU_VR, (double)nrp * nn, out, base, r0);
     return (uint64_t)nr * nn;
 }
 

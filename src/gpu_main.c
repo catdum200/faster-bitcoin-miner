@@ -1,6 +1,7 @@
 /* fbm-gpu: the OpenCL (GPU) front end. It has no CPU-specific code, so it
  * builds wherever there is a C11 compiler and an OpenCL driver, Windows
  * included. */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,14 +29,16 @@ static void usage(void)
             "  fbm-gpu mine --header HEX80 [options] search for valid (version, nonce) pairs\n"
             "      --start NONCE --count N (default: whole 2^32 range)\n"
             "      --versions N (BIP 320 rolled versions, default 1; 64+ uses vr)\n"
-            "      --kernel nonce|vr\n"
+            "      --kernel nonce|vr   --seconds S (stop after S seconds; Ctrl-C also stops)\n"
             "  fbm-gpu dump --out FILE           save the driver-compiled kernels (AMD: ELF,\n"
             "                                    for tools/gpu_isacheck.py)\n"
             "common options:\n"
             "  --platform P --device D           pick a device (default: first GPU)\n"
             "  --wg N                            work-group size (default 64)\n"
-            "  --nonce-iters N --vr-iters N      nonces per work-item per launch (16, 128)\n"
-            "  --launch-ms MS                    target kernel launch length (default 100)\n");
+            "  --nonce-iters N --vr-iters N      nonces per work-item per launch (16, 64)\n"
+            "  --launch-ms MS                    target kernel launch length (default 8, which\n"
+            "                                    keeps a desktop on the same GPU responsive)\n"
+            "  --dedicated                       100 ms launches, for a GPU with no display\n");
 }
 
 static const char *arg_value(int argc, char **argv, const char *name, const char *def)
@@ -54,8 +57,15 @@ static double now(void)
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* Launch sizes are set in hashes; --launch-ms converts at a nominal 3 GH/s
- * (an RX 9060 XT-class estimate), so slower devices get longer launches. */
+static int has_flag(int argc, char **argv, const char *name)
+{
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static fbm_gpu *open_from_args(int argc, char **argv)
 {
     fbm_gpu_opts o;
@@ -64,10 +74,11 @@ static fbm_gpu *open_from_args(int argc, char **argv)
     o.device = atoi(arg_value(argc, argv, "--device", "-1"));
     o.wg = (unsigned)atoi(arg_value(argc, argv, "--wg", "64"));
     o.nonce_iters = (unsigned)atoi(arg_value(argc, argv, "--nonce-iters", "16"));
-    o.vr_iters = (unsigned)atoi(arg_value(argc, argv, "--vr-iters", "128"));
-    o.launch_hashes = atof(arg_value(argc, argv, "--launch-ms", "100")) * 3e6;
+    o.vr_iters = (unsigned)atoi(arg_value(argc, argv, "--vr-iters", "64"));
+    o.launch_ms = atof(arg_value(argc, argv, "--launch-ms",
+                                 has_flag(argc, argv, "--dedicated") ? "100" : "8"));
     if (o.wg == 0 || o.wg > 1024 || o.nonce_iters == 0 || o.vr_iters == 0 ||
-        o.launch_hashes < 1) {
+        o.launch_ms <= 0 || o.launch_ms > 1000) {
         fprintf(stderr, "bad tuning option\n");
         return NULL;
     }
@@ -250,6 +261,47 @@ static void test_overflow(fbm_gpu *g)
     o->hit_cap = saved;
 }
 
+/* A small scan with a loose threshold, checked exactly against the host
+ * reference. On a card that is unstable (overclock, undervolt, heat) or a
+ * driver that miscompiles, this fails; the host re-check of candidates only
+ * catches false positives, never missed blocks. */
+static int canary(fbm_gpu *g, fbm_gpu_layout layout)
+{
+    fbm_job job;
+    random_job(&job, 0x00ffffff); /* ~1/256 of hashes are candidates */
+    const uint32_t nr = layout == FBM_GPU_VR ? 64 : 1, n0 = rng32() & 0x7fffffff;
+    const uint64_t nn = layout == FBM_GPU_VR ? 256 : 16384;
+    fbm_hits want = ref_scan(&job, 0, nr, n0, nn), got = new_hits(1u << 16);
+    fbm_gpu_scan(g, layout, &job, 0, nr, n0, nn, &got);
+    sort_hits(&got);
+    const int ok = got.n == want.n && !memcmp(got.v, want.v, want.n * sizeof(fbm_hit));
+    free(got.v);
+    free(want.v);
+    return ok;
+}
+
+static void hardware_error(const char *what)
+{
+    fprintf(stderr, "\nERROR: %s.\nThe kernels pass their tests, so this points at the GPU or its driver: "
+            "if you changed clocks, voltage or the power limit, undo that and run `fbm-gpu test`. "
+            "Stopping, because a card that computes wrong hashes can also miss blocks.\n", what);
+}
+
+/* The canary must notice a device that computes wrong hashes. */
+static void test_canary(fbm_gpu *g)
+{
+    fbm_gpu_opts *o = fbm_gpu_options(g);
+    printf("the mining canary detects a faulty device\n");
+    for (int layout = 0; layout < 2; layout++) {
+        CHECK(canary(g, (fbm_gpu_layout)layout), "%s: canary fails on a good device",
+              layout_name[layout]);
+        o->inject_fault = 1;
+        CHECK(!canary(g, (fbm_gpu_layout)layout), "%s: canary misses an injected fault",
+              layout_name[layout]);
+        o->inject_fault = 0;
+    }
+}
+
 static int cmd_test(int argc, char **argv)
 {
     fbm_gpu *g = open_from_args(argc, argv);
@@ -261,13 +313,14 @@ static int cmd_test(int argc, char **argv)
     /* Tiny launches: many launches per scan, partial work-groups, iteration
      * counts that do not divide the range. */
     const fbm_gpu_opts saved = *o;
-    o->launch_hashes = 1000;
+    o->launch_hashes = 1000; /* fixed, instead of launch_ms */
     o->nonce_iters = 3;
     o->vr_iters = 7;
     test_differential(g, "tiny launches (1000 hashes, 3 and 7 nonces per work-item)");
     *o = saved;
     test_known(g);
     test_overflow(g);
+    test_canary(g);
     printf(failures ? "%d FAILURE(S)\n" : "all GPU tests passed\n", failures);
     fbm_gpu_close(g);
     return failures ? 1 : 0;
@@ -385,6 +438,14 @@ static int cmd_bench(int argc, char **argv)
 
 /* ---- mine ---------------------------------------------------------------- */
 
+static volatile sig_atomic_t stop_requested;
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    stop_requested = 1;
+}
+
 static int cmd_mine(int argc, char **argv)
 {
     const char *hex = arg_value(argc, argv, "--header", NULL);
@@ -392,6 +453,7 @@ static int cmd_mine(int argc, char **argv)
     uint64_t start = strtoull(arg_value(argc, argv, "--start", "0"), NULL, 0);
     uint64_t count = strtoull(arg_value(argc, argv, "--count", "4294967296"), NULL, 0);
     uint32_t versions = (uint32_t)strtoul(arg_value(argc, argv, "--versions", "1"), NULL, 0);
+    const double limit = atof(arg_value(argc, argv, "--seconds", "0"));
     fbm_job job;
     uint8_t target[32];
 
@@ -418,19 +480,28 @@ static int cmd_mine(int argc, char **argv)
     printf("kernel %s, difficulty %.3f, %u version(s) x %llu nonces from %llu\n",
            layout_name[layout], fbm_target_difficulty(target), versions,
            (unsigned long long)count, (unsigned long long)start);
+    if (!canary(g, layout)) {
+        hardware_error("the start-up check (a known candidate set) came back wrong");
+        fbm_gpu_close(g);
+        return 3;
+    }
+    signal(SIGINT, on_sigint);
 
-    /* Scan in slices of ~2^32 hashes so progress and solutions show up
-     * while it runs (~1-2 s each on a fast GPU). */
-    const uint64_t slice = versions >= (1u << 16) ? 1 << 16 : (1ull << 32) / versions;
-    int solutions = 0;
+    int solutions = 0, rc = 1;
     size_t candidates = 0;
-    uint64_t hashes = 0;
+    uint64_t hashes = 0, off = 0;
     const double t0 = now();
-    for (uint64_t off = 0; off < count; off += slice) {
-        const uint64_t nn = count - off < slice ? count - off : slice;
+    double next_canary = t0 + 60;
+    for (int slice = 0; off < count && !stop_requested && !(limit > 0 && now() - t0 >= limit);
+         slice++) {
+        /* Slices of ~1 s of work, so Ctrl-C, --seconds and progress respond;
+         * the first is short, until the rate has been measured. */
+        uint64_t nn = (uint64_t)(fbm_gpu_rate(g, layout) * (slice ? 1.0 : 0.1) / versions);
+        nn = nn < 1 ? 1 : nn > count - off ? count - off : nn;
         fbm_hit buf[4096];
         fbm_hits hits = {buf, 4096, 0};
         hashes += fbm_gpu_scan(g, layout, &job, 0, versions, (uint32_t)(start + off), nn, &hits);
+        off += nn;
         candidates += hits.n;
         for (size_t i = 0; i < hits.n && i < hits.cap; i++) {
             uint8_t hdr[80], hash[32];
@@ -440,10 +511,11 @@ static int cmd_mine(int argc, char **argv)
             fbm_header_set(hdr, FBM_OFF_NONCE, hits.v[i].nonce);
             fbm_sha256d(hdr, 80, hash);
             if (fbm_top32_le(hash) > job.t7) {
-                /* The filter is exact, so this can only be a kernel or driver
-                 * bug, which could also be dropping real blocks. */
-                fprintf(stderr, "BUG: GPU reported version 0x%08x nonce %u, which fails its own "
-                        "pre-filter; aborting\n", hits.v[i].version, hits.v[i].nonce);
+                /* The filter is exact, so this is a wrong hash on the GPU. */
+                char what[160];
+                snprintf(what, sizeof what, "the GPU reported version 0x%08x nonce %u, which "
+                         "fails its own pre-filter", hits.v[i].version, hits.v[i].nonce);
+                hardware_error(what);
                 fbm_gpu_close(g);
                 return 3;
             }
@@ -458,15 +530,28 @@ static int cmd_mine(int argc, char **argv)
         if (hits.n > hits.cap)
             fprintf(stderr, "warning: %zu candidates in one slice, only %zu checked\n", hits.n,
                     hits.cap);
+        if (now() >= next_canary) {
+            if (!canary(g, layout)) {
+                hardware_error("the periodic check (a known candidate set) came back wrong");
+                fbm_gpu_close(g);
+                return 3;
+            }
+            next_canary = now() + 60;
+        }
         const double dt = now() - t0;
-        fprintf(stderr, "\r%.1f%% %.1f MH/s", 100.0 * (off + nn) / count, hashes / dt / 1e6);
+        fprintf(stderr, "\r%.2f%% of the range, %.1f MH/s   ", 100.0 * off / count,
+                hashes / dt / 1e6);
     }
     const double dt = now() - t0;
     fprintf(stderr, "\n");
+    if (stop_requested || off < count)
+        printf("stopped at nonce offset %llu of %llu%s\n", (unsigned long long)off,
+               (unsigned long long)count, stop_requested ? " (Ctrl-C)" : " (--seconds)");
     printf("%llu hashes in %.3f s = %.3f MH/s, %d solution(s), %zu candidate(s)\n",
            (unsigned long long)hashes, dt, hashes / dt / 1e6, solutions, candidates);
+    rc = solutions ? 0 : 1;
     fbm_gpu_close(g);
-    return solutions ? 0 : 1;
+    return rc;
 }
 
 int main(int argc, char **argv)

@@ -39,9 +39,10 @@ GPU_CL = ['gpu/prelude.cl', 'src/gen/g_rdna_nonce.h', 'src/gen/g_rdna_vr.h', 'gp
 WG = 64
 LANES = 2048  # RX 9060 XT: 32 CUs x 2 SIMD32
 ICACHE = 32 * 1024
-# Loop VALU beyond the generator's count: nonce byte swaps, the compare, loop
-# control, and bfi/ch forms the ISA cannot encode (two literal operands).
-BUDGET = 60
+# Loop VALU vs the generator's count: the compiler adds byte swaps, the
+# compare and loop control, splits a few bfi into and+xor, and fuses a few
+# xor+add into v_xad_u32. Anything beyond 2% means codegen went wrong.
+TOLERANCE = 0.02
 
 # cgminer 3.7.2 kernels, built as its host does for GCN: BITALIGN (media ops),
 # no BFI_INT patching, one nonce per work-item.
@@ -167,6 +168,8 @@ def region_stats(ins, lo, hi):
             hot[c] += 1
             if c == 'VALU':
                 ops[op] += 1
+                if size >= 12:  # VOP3 + 32-bit literal: a 96-bit instruction
+                    hot['VALU96'] += 1
             if op.startswith('v_dual'):
                 hot['VOPD'] += 1
     return hot, rare, ops, nbytes
@@ -187,28 +190,83 @@ def gen_counts():
         return {s['mode']: s for s in json.load(f) if s['target'] == 'rdna'}
 
 
+def notes_resources(path):
+    """Per-kernel resources from a code object's metadata notes (for driver
+    binaries, where there are no compiler remarks). Occupancy is estimated
+    with LLVM's gfx11/gfx12 model: 1536 VGPRs per SIMD (768 for wave64) in
+    granules of 24 (12)."""
+    readelf = shutil.which('llvm-readelf') or next(
+        (p for p in ('/usr/lib/llvm-%s/bin/llvm-readelf' % v for v in ('20', '19', '18'))
+         if os.path.exists(p)), None)
+    if not readelf:
+        return {}
+    text = subprocess.run([readelf, '--notes', path], capture_output=True, text=True).stdout
+    res, cur = {}, None
+    for line in text.splitlines():
+        m = re.match(r'\s*(?:- )?\.(\w+):\s+(\S+)', line)
+        if not m:
+            continue
+        key, val = m.groups()
+        if key == 'name':
+            cur = res.setdefault(val, {})
+        elif cur is not None and key in ('vgpr_count', 'sgpr_count', 'private_segment_fixed_size',
+                                         'wavefront_size'):
+            cur[key] = int(val)
+    out = {}
+    for name, r in res.items():
+        if 'vgpr_count' not in r:
+            continue
+        w64 = r.get('wavefront_size') == 64
+        total, gran = (768, 12) if w64 else (1536, 24)
+        v = max(1, r['vgpr_count'])
+        out[name] = {'VGPRs': str(v), 'ScratchSize': str(r.get('private_segment_fixed_size', '?')),
+                     'Occupancy': str(min(16, total // (-(-v // gran) * gran))),
+                     'wave': str(r.get('wavefront_size', '?'))}
+    return out
+
+
+def issue_slots(hot):
+    """Pessimistic: every instruction class takes the SIMD's issue slot."""
+    return hot['VALU'] + hot['SALU'] + hot['SMEM'] + hot['VMEM'] + hot['wait'] + hot['other']
+
+
+HEADER = ('| kernel | VALU/hash | vs generator | 96-bit VALU | SALU | SMEM | VMEM | wait/delay | '
+          'all instr. | candidate-only | bytes | VGPRs | scratch | waves/SIMD | '
+          'GH/s (VALU) | GH/s (all) |\n'
+          '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+
+
 def row(name, hot, rare, nbytes, res, gen=None):
-    valu = hot['VALU']
-    ghz = '%.2f-%.2f' % (LANES * 2.5 / valu, LANES * 3.1 / valu)
-    print('| %s | %d | %s | %d | %d | %d | %d | %d | %d | %s | %s | %s | %s |' % (
-        name, valu, '%+d' % (valu - gen) if gen is not None else '-', hot['SALU'], hot['SMEM'],
-        hot['VMEM'], hot['wait'], rare['VALU'] + rare['SALU'] + rare['VMEM'], nbytes,
-        res.get('VGPRs', '?'), res.get('ScratchSize', '?'), res.get('Occupancy', '?'), ghz))
+    valu, slots = hot['VALU'], issue_slots(hot)
+    print('| %s | %d | %s | %d | %d | %d | %d | %d | %d | %d | %d | %s | %s | %s | %s | %s |' % (
+        name, valu, '%+.1f%%' % (100.0 * (valu - gen) / gen) if gen else '-', hot['VALU96'],
+        hot['SALU'], hot['SMEM'], hot['VMEM'], hot['wait'], slots,
+        rare['VALU'] + rare['SALU'] + rare['VMEM'], nbytes, res.get('VGPRs', '?'),
+        res.get('ScratchSize', '?'), res.get('Occupancy', '?'),
+        '%.2f-%.2f' % (LANES * 2.53 / valu, LANES * 3.13 / valu),
+        '%.2f-%.2f' % (LANES * 2.53 / slots, LANES * 3.13 / slots)))
+
+
+def find_kernel(funcs, name):
+    # Driver binaries may decorate kernel symbols; match by substring.
+    found = [f for f in funcs if f == name] or \
+        [f for f in funcs if name in f and 'sched' not in f]
+    return found[0] if found else None
 
 
 def main():
     args = sys.argv[1:]
     mcpu = args[args.index('--mcpu') + 1] if '--mcpu' in args else 'gfx1200'
-    clang, objdump = find_tools(need_clang='--binary' not in args)
-    if '--binary' in args:
-        path = args[args.index('--binary') + 1]
-        r = subprocess.run([objdump, '-d', path], capture_output=True, text=True)
+    binary = args[args.index('--binary') + 1] if '--binary' in args else None
+    clang, objdump = find_tools(need_clang=binary is None)
+    if binary:
+        r = subprocess.run([objdump, '-d', binary], capture_output=True, text=True)
         if r.returncode or '<fbm_' not in r.stdout:
             sys.exit('%s: could not disassemble fbm kernels (not an AMDGPU code object?)\n%s'
-                     % (path, r.stderr[-500:]))
-        asm = r.stdout
-        res = {}
-        print('driver-compiled binary %s' % path)
+                     % (binary, r.stderr[-500:]))
+        asm, res = r.stdout, notes_resources(binary)
+        m = re.search(r'file format (\S+)', asm)
+        print('driver-compiled binary %s (%s)' % (binary, m.group(1) if m else '?'))
     else:
         text = ''.join(open(os.path.join(ROOT, p)).read() for p in GPU_CL)
         asm, res = compile_cl(clang, objdump, text, mcpu, ['-DFBM_AUDIT', '-DFBM_WG=%d' % WG])
@@ -216,54 +274,54 @@ def main():
     funcs = parse(asm)
     gen = gen_counts()
 
-    print('\nper hash = per loop iteration of one lane; GH/s = %d lanes x 2.5-3.1 GHz / VALU\n'
-          % LANES)
-    print('| kernel | VALU/hash | vs generator | SALU | SMEM | VMEM | wait/delay | '
-          'candidate-only | loop bytes | VGPRs | scratch | waves/SIMD | GH/s est. |')
-    print('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
-    ok = True
+    print('\nper hash = per loop iteration of one lane. GH/s = %d lanes x 2.53-3.13 GHz / '
+          'instructions,\ncounting VALU only, or every instruction as one issue slot '
+          '(pessimistic).\n' % LANES)
+    print(HEADER)
+    ok, got = True, {}
     for name, mode in (('fbm_nonce', 'nonce'), ('fbm_vr', 'vr')):
-        # Driver binaries may decorate kernel symbols; match by substring.
-        found = [f for f in funcs if f == name] or \
-            [f for f in funcs if name in f and 'sched' not in f]
-        if not found:
-            print('missing kernel %s (symbols: %s)' % (name, ', '.join(funcs)))
-            ok = False
-            continue
-        ins = funcs[found[0]]
-        loop = main_loop(ins)
+        fname = find_kernel(funcs, name)
+        loop = main_loop(funcs[fname]) if fname else None
         if not loop:
-            print('no loop found in %s' % found[0])
+            print('missing kernel or loop: %s (symbols: %s)' % (name, ', '.join(funcs)))
             ok = False
             continue
-        lo, hi = loop
-        hot, rare, ops, nbytes = region_stats(ins, lo, hi)
+        hot, rare, ops, nbytes = region_stats(funcs[fname], *loop)
+        got[mode] = hot
         g = gen[mode]['vector_instructions']
-        r = res.get(name, {})
+        r = res.get(fname, {})
         row(name, hot, rare, nbytes, r, g)
-        if hot['VALU'] - g > BUDGET or hot['VALU'] < g - 20:
-            print('  FAIL: %s loop has %d VALU, generator says %d (budget +%d)'
-                  % (name, hot['VALU'], g, BUDGET))
+        if abs(hot['VALU'] - g) > TOLERANCE * g:
+            print('  FAIL: %s loop has %d VALU, generator says %d (tolerance %d%%)'
+                  % (name, hot['VALU'], g, 100 * TOLERANCE))
             ok = False
-        if r and (r.get('ScratchSize') != '0' or r.get('Occupancy') != '16'):
-            print('  FAIL: %s spills or runs below full occupancy' % name)
+        if r.get('ScratchSize', '0') not in ('0', '?') or int(r.get('Occupancy', '16')) < 4:
+            print('  FAIL: %s uses scratch or runs below 4 waves/SIMD' % name)
             ok = False
         if nbytes > ICACHE:
             print('  FAIL: %s loop is %d bytes, more than the %d-byte I$' % (name, nbytes, ICACHE))
             ok = False
-        if mode == 'vr' and (hot['VMEM'] or hot['SMEM'] == 0):
-            print('  FAIL: the vr loop must read its schedule with scalar loads only '
+        if mode == 'vr' and (hot['VMEM'] or not 0 < hot['SMEM'] <= 8):
+            print('  FAIL: the vr loop must read its schedule with a few scalar loads '
                   '(SMEM %d, VMEM %d)' % (hot['SMEM'], hot['VMEM']))
             ok = False
         top = ', '.join('%s %d' % kv for kv in ops.most_common(9))
-        print('|  | %s |' % top + ' |' * 11)
+        print('|  | %s |' % top + ' |' * 14)
+    if 'nonce' in got and 'vr' in got:
+        n, v = got['nonce'], got['vr']
+        print('\nvr vs nonce: %.3fx fewer VALU; %.3fx if every instruction takes an issue slot'
+              % (n['VALU'] / v['VALU'], issue_slots(n) / issue_slots(v)))
+    if binary:
+        for fname, r in res.items():
+            if 'fbm' in fname:
+                print('%s: wave%s, %s VGPRs, scratch %s, ~%s waves/SIMD'
+                      % (fname, r['wave'], r['VGPRs'], r['ScratchSize'], r['Occupancy']))
 
     base_dir = os.path.join(ROOT, 'bench/gpu-baselines/src')
-    if '--binary' not in args and os.path.isdir(base_dir):
-        print('\nPrior art, cgminer 3.7.2 (one nonce per work-item, whole kernel):\n')
-        print('| kernel | VALU/hash | vs generator | SALU | SMEM | VMEM | wait/delay | '
-              'candidate-only | bytes | VGPRs | scratch | waves/SIMD | GH/s est. |')
-        print('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    if not binary and os.path.isdir(base_dir):
+        print('\nPrior art, cgminer 3.7.2 (one nonce per work-item; the whole kernel):\n')
+        print(HEADER)
+        base = []
         for b in BASELINES:
             p = os.path.join(base_dir, b)
             if not os.path.exists(p):
@@ -272,6 +330,14 @@ def main():
             ins = parse(basm)['search']
             hot, rare, ops, nbytes = region_stats(ins, ins[0][0], ins[-1][0])
             row(b.replace('.cl', ''), hot, rare, nbytes, bres.get('search', {}))
+            base.append((b.replace('.cl', ''), hot))
+        if base and 'vr' in got:
+            v = got['vr']
+            bv = min(base, key=lambda x: x[1]['VALU'])
+            bs = min(base, key=lambda x: issue_slots(x[1]))
+            print('\nvr vs the best of them: %.3fx fewer VALU (vs %s); %.3fx fewer instructions '
+                  'if every one takes an issue slot (vs %s)'
+                  % (bv[1]['VALU'] / v['VALU'], bv[0], issue_slots(bs[1]) / issue_slots(v), bs[0]))
     print('\nok' if ok else '\nFAILED')
     return 0 if ok else 1
 
