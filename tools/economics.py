@@ -88,8 +88,10 @@ def main():
         ('Revenue / electricity cost', '%.2g' % (usd_year / power_usd_year)),
         ('Cloud VM rent at $%.2f/h' % a.rent_usd_per_hour, '$%.0f per year (%.2gx revenue)'
          % (rent_usd_year, rent_usd_year / usd_year)),
-        ('ASIC revenue for comparison', '%.4f BTC/day = $%.0f per year per machine'
+        ('ASIC revenue for comparison', '%.3g BTC/day = $%.0f per year per machine'
          % (asic_btc_day, asic_btc_day * 365 * net['usd'])),
+        ('ASIC electricity at $%.2f/kWh' % a.usd_per_kwh, '$%.0f per year per machine'
+         % (ASIC['watts'] / 1000 * 24 * 365 * a.usd_per_kwh)),
     ]
     width = max(len(k) for k, _ in rows)
     print('| %s | value |\n|%s|---|' % ('quantity'.ljust(width), '-' * (width + 2)))

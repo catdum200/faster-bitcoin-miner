@@ -12,19 +12,19 @@ answer one question: **is there a more efficient way to mine bitcoin?**
 2. **This project implements every such trick we know of, plus one that
    existing CPU miners lack.** In SIMD lanes it shares the message schedule
    across BIP 320 rolled versions: "overt AsicBoost" (2016), applied to
-   AVX-512.
-   On this 4-core Cascade Lake VM it reaches about 128 MH/s on 4 threads:
-   about **1.19x the fastest open-source CPU sha256d miner** (cpuminer-opt)
-   and about **35x a naive implementation**. These are preliminary figures;
-   the final ones, with confidence intervals, are in `docs/RESULTS.md`.
-3. **None of this makes CPU mining worthwhile.** At about 128 MH/s this machine
-   would earn about **$0.002 per year** and find a block roughly once every
-   **141 million years**. Per hash, it uses about **17,000x more energy** than
-   a current ASIC. In the real
-   world, mining efficiency comes from ASIC silicon (~10-15 J/TH), cheap
-   electricity and pools. The version-rolling trick used here already ships
-   in ASICs: 14 of the 15 most recent blocks we checked have rolled version
-   bits.
+   AVX-512. On this 4-core Cascade Lake VM it reaches **124.7 MH/s**, which is
+   **1.21x the fastest open-source CPU sha256d code we know** (cpuminer-opt's
+   16-way AVX-512 kernel: 1.207x, 95% CI [1.194, 1.223], same machine and
+   harness) and **35x a naive implementation**. The prior-art tricks alone
+   only reach parity (1.03x); version rolling is the whole gain.
+3. **None of this makes CPU mining worthwhile.** At 124.7 MH/s this machine
+   would earn about **$0.002 per year**, while its electricity alone costs
+   about $26. Solo, it would find a block about once every **145 million
+   years**. Per hash, it uses about **18,000x more energy** than a current
+   ASIC. In the real world, mining efficiency comes from ASIC silicon
+   (~10-15 J/TH), cheap electricity and pools. The version-rolling trick used
+   here already ships in ASICs: 14 of the 15 most recent blocks we checked
+   have rolled version bits.
 
 The full numbers and the method are in [`docs/RESULTS.md`](docs/RESULTS.md).
 
@@ -140,6 +140,11 @@ docs/                  PLAN_v1 -> CRITIQUE -> PLAN -> RESULTS
 
 ## Limitations and next steps
 
+- **AVX2-only CPUs.** The unrolled 256-bit kernels are front-end-bound:
+  16-30 KB loops run from the legacy decoders. A partially rolled kernel that
+  fits the micro-op cache is the most promising next step for CPUs without
+  AVX-512. Relatedly, version rolling did not help the 256-bit AVX-512VL
+  kernel; see "Open issues" in the results.
 - **SHA-NI.** Most current CPUs (AMD Zen, Intel Ice Lake and later) have SHA
   extensions, which would beat AVX2 there. This VM has no SHA-NI, so a kernel
   could not be tested and none is included.

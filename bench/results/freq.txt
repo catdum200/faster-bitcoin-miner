@@ -1,0 +1,4 @@
+core clock (GHz), dependent-add chains:
+  scalar           3.29
+  256-bit (ymm)    3.30
+  512-bit (zmm)    2.76

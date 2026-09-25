@@ -1,0 +1,4 @@
+cpuminer sha256d: 4-way=1 8-way=1
+cpuminer           1       11.379     10.973..11.575 MH/s (median, min..max)
+cpuminer sha256d: 4-way=1 8-way=1
+cpuminer           4       43.879     42.765..44.546 MH/s (median, min..max)

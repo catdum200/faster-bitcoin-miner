@@ -449,8 +449,9 @@ def ablation():
         ('+ version rolling, 128 versions per nonce (T7)', True, True, True, 'vr'),
     ]
     for target, lanes in (('avx512', 16), ('avx2', 8)):
-        print('\n%s (%d lanes): vector instructions per hash' % (target, lanes))
-        print('| step | per hash | vs previous | vs naive |\n|---|---:|---:|---:|')
+        label = {'avx512': 'AVX-512', 'avx2': 'AVX2'}[target]
+        print('\n**%s (%d lanes)**, vector instructions per hash:\n' % (label, lanes))
+        print('| step | per hash | vs previous | total reduction |\n|---|---:|---:|---:|')
         first = prev = None
         for name, midstate, fold, early, mode in steps:
             vec, per_nonce = build_ablation(target, midstate, fold, early, mode)
@@ -459,9 +460,10 @@ def ablation():
             if per_nonce:
                 note = ' (+%.1f scalar per hash for the shared schedule)' % (per_nonce / 128)
             first = first or per_hash
-            print('| %s | %.1f%s | %s | %.2fx fewer |' % (
+            print('| %s | %.1f%s | %s | %s |' % (
                 name, per_hash, note,
-                '%.1f%%' % (100 * (per_hash / prev - 1)) if prev else '-', first / per_hash))
+                '%.1f%%' % (100 * (per_hash / prev - 1)) if prev else '-',
+                '%.2fx' % (first / per_hash) if prev else '-'))
             prev = per_hash
 
 

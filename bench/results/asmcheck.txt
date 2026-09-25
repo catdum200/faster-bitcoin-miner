@@ -1,0 +1,8 @@
+hot loop                insns    alu  expected gpr-bcast  reg-mov  spill
+fbm_scan_avx2            6106   5753      5749         0       32    147
+fbm_scan_avx2_vr         5158   4911      4909         0       20     62
+fbm_scan_avx512vl        3208   2849      2847         1      166    119
+fbm_scan_avx512vl_vr     2618   2387      2387         0      155     45
+fbm_scan_avx512          3207   2849      2847         1      166    119
+fbm_scan_avx512_vr       2617   2387      2387         0      155     45
+ok
