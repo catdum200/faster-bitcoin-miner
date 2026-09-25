@@ -28,6 +28,34 @@ answer one question: **is there a more efficient way to mine bitcoin?**
 
 The full numbers and the method are in [`docs/RESULTS.md`](docs/RESULTS.md).
 
+## What about a home GPU? (e.g. Radeon RX 9060 XT 16 GB)
+
+Still a bad idea for bitcoin. A GPU is far faster than this CPU but still
+thousands of times less efficient than an ASIC:
+
+- **Hash rate.** A published hashcat run on the RX 9060 XT (ROCm OpenCL, June
+  2025) measured 12.78 GH/s SHA-1 and 1.40 GH/s SHA-512, at ~89 W on the GPU
+  sensor. An RX 6800 XT measured on all three algorithms runs SHA-256 at
+  0.424x its SHA-1 rate and 3.73x its SHA-512 rate. Applying those ratios
+  gives **~5.2-5.4 GH/s of single SHA-256**. Mining costs ~1.5-1.8 SHA-256
+  compressions per attempt even with every trick here, so that is **~3 GH/s
+  of bitcoin mining**, ~24x this 4-core CPU. This is an estimate; no GPU was
+  available to test on.
+- **Money.** `python3 tools/economics.py --mhs 3000 --watts 90 --usd-per-kwh
+  0.15 --rent-usd-per-hour 0` gives about **$0.04 of expected revenue per
+  year**, against **$118-210 per year** of electricity for the card alone (90 W
+  measured, 160 W rated), before the rest of the PC.
+- **Solo odds.** About one block per **6 million years**, a ~1 in 6 million
+  chance per year.
+- **Energy.** ~30,000-53,000 J/TH, **2,000-4,000x worse** than an Antminer S21
+  XP (13.5 J/TH).
+- **Better code does not change this.** A perfect GPU kernel with version
+  rolling would add perhaps 15-20%, i.e. about a cent more per year.
+
+Sources: [RX 9060 XT hashcat results (OpenBenchmarking)](https://openbenchmarking.org/result/2506064-PTS-NEWGPUCO48),
+[RX 6800 XT hashcat benchmarks](https://gist.github.com/epixoip/99085955a1145ff61ec83512a50421a7),
+[RX 9060 XT specs, Tom's Hardware](https://www.tomshardware.com/pc-components/gpus/amd-radeon-rx-9060-xt-16gb-review/7).
+
 ## How it was built: plan, critique, revise
 
 1. [`docs/PLAN_v1.md`](docs/PLAN_v1.md): the first plan.

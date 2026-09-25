@@ -8,6 +8,7 @@ Usage: tools/economics.py --mhs 128 --watts 30 [--usd-per-kwh 0.10]
 --watts  power drawn while mining. This VM exposes no power counters, so
          pass an estimate. Cascade Lake Xeons draw ~5-10 W per busy core at
          package level, so ~20-40 W for 4 cores.
+--rent-usd-per-hour  cloud rent; pass 0 for hardware you own (e.g. a home GPU)
 """
 import argparse
 import json
@@ -83,11 +84,14 @@ def main():
         ('Chance of a block within a year', '%.2g' % p_year),
         ('Energy efficiency (at %.0f W, estimated)' % a.watts, '%.3g J/TH' % j_per_th),
         ('%s' % ASIC['name'], '%.1f J/TH, %.0f TH/s' % (asic_jth, ASIC['ths'])),
-        ('CPU energy per hash vs ASIC', '%.2gx worse' % (j_per_th / asic_jth)),
+        ('Energy per hash vs that ASIC', '%.2gx worse' % (j_per_th / asic_jth)),
         ('Electricity at $%.2f/kWh' % a.usd_per_kwh, '$%.2f per year' % power_usd_year),
         ('Revenue / electricity cost', '%.2g' % (usd_year / power_usd_year)),
-        ('Cloud VM rent at $%.2f/h' % a.rent_usd_per_hour, '$%.0f per year (%.2gx revenue)'
-         % (rent_usd_year, rent_usd_year / usd_year)),
+    ]
+    if a.rent_usd_per_hour > 0:  # 0 for hardware you own
+        rows.append(('Cloud VM rent at $%.2f/h' % a.rent_usd_per_hour,
+                     '$%.0f per year (%.2gx revenue)' % (rent_usd_year, rent_usd_year / usd_year)))
+    rows += [
         ('ASIC revenue for comparison', '%.3g BTC/day = $%.0f per year per machine'
          % (asic_btc_day, asic_btc_day * 365 * net['usd'])),
         ('ASIC electricity at $%.2f/kWh' % a.usd_per_kwh, '$%.0f per year per machine'
