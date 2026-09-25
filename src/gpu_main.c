@@ -52,6 +52,8 @@ static void usage(void)
             "  --launch-ms MS                    target kernel launch length (default 8, which\n"
             "                                    keeps a desktop on the same GPU responsive)\n"
             "  --dedicated                       100 ms launches, for a GPU with no display\n"
+            "  --program FILE                    run a prebuilt program binary instead of the\n"
+            "                                    source (make gpu-codeobj: the audited ISA)\n"
             "  --baseline FILE                   cgminer's poclbm kernel, run as the prior-art\n"
             "                                    baseline (default: bench/gpu-baselines/src/\n"
             "                                    poclbm130302.cl, from fetch.sh, if present)\n");
@@ -66,12 +68,26 @@ static const char *arg_value(int argc, char **argv, const char *name, const char
     return def;
 }
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+static double now(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+#else
 static double now(void)
 {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
+#endif
 
 static int has_flag(int argc, char **argv, const char *name)
 {
@@ -91,6 +107,7 @@ static fbm_gpu *open_from_args(int argc, char **argv)
     o.wg = (unsigned)atoi(arg_value(argc, argv, "--wg", "64"));
     o.nonce_iters = (unsigned)atoi(arg_value(argc, argv, "--nonce-iters", "16"));
     o.vr_iters = (unsigned)atoi(arg_value(argc, argv, "--vr-iters", "64"));
+    o.program = arg_value(argc, argv, "--program", NULL);
     o.launch_ms = atof(arg_value(argc, argv, "--launch-ms",
                                  has_flag(argc, argv, "--dedicated") ? "100" : "8"));
     if (o.wg == 0 || o.wg > 1024 || o.nonce_iters == 0 || o.vr_iters == 0 ||

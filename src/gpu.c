@@ -8,6 +8,7 @@
 #include <CL/cl.h>
 #endif
 
+#include "clload.h"
 #include "gpu.h"
 
 #include <stdlib.h>
@@ -73,6 +74,7 @@ void fbm_gpu_default_opts(fbm_gpu_opts *o)
     o->hit_cap = 1u << 20;
     o->build_opts = "";
     o->inject_fault = 0;
+    o->program = NULL;
 }
 
 static cl_uint platforms(cl_platform_id *p, cl_uint max)
@@ -93,6 +95,8 @@ static cl_uint devices(cl_platform_id p, cl_device_id *d, cl_uint max)
 
 int fbm_gpu_list(void)
 {
+    if (fbm_cl_load() != 0)
+        return 0;
     cl_platform_id p[16];
     cl_uint np = platforms(p, 16);
     int total = 0;
@@ -159,6 +163,8 @@ static int pick_device(const fbm_gpu_opts *o, cl_device_id *out)
 
 fbm_gpu *fbm_gpu_open(const fbm_gpu_opts *o)
 {
+    if (fbm_cl_load() != 0)
+        return NULL;
     fbm_gpu *g = calloc(1, sizeof *g);
     cl_int err;
     char opts[1024];
@@ -182,9 +188,36 @@ fbm_gpu *fbm_gpu_open(const fbm_gpu_opts *o)
     g->q = clCreateCommandQueue(g->ctx, g->dev, CL_QUEUE_PROFILING_ENABLE, &err);
     CL_OK(err);
 
-    g->prog = clCreateProgramWithSource(g->ctx, fbm_gpu_src_COUNT, (const char **)fbm_gpu_src,
-                                        NULL, &err);
-    CL_OK(err);
+    if (o->program) {
+        /* e.g. `make gpu-codeobj`: then the ISA that runs is the audited one */
+        FILE *f = fopen(o->program, "rb");
+        if (!f) {
+            perror(o->program);
+            fbm_gpu_close(g);
+            return NULL;
+        }
+        fseek(f, 0, SEEK_END);
+        const size_t n = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        unsigned char *bin = malloc(n ? n : 1);
+        const size_t got = fread(bin, 1, n, f);
+        fclose(f);
+        const unsigned char *bins[1] = {bin};
+        cl_int status = CL_SUCCESS;
+        g->prog = clCreateProgramWithBinary(g->ctx, 1, &g->dev, &got, bins, &status, &err);
+        free(bin);
+        if (err != CL_SUCCESS || status != CL_SUCCESS) {
+            fprintf(stderr, "the runtime rejects %s (error %d/%d); run from source instead\n",
+                    o->program, (int)err, (int)status);
+            g->prog = NULL;
+            fbm_gpu_close(g);
+            return NULL;
+        }
+    } else {
+        g->prog = clCreateProgramWithSource(g->ctx, fbm_gpu_src_COUNT,
+                                            (const char **)fbm_gpu_src, NULL, &err);
+        CL_OK(err);
+    }
     snprintf(opts, sizeof opts, "-cl-std=CL1.2 -DFBM_WG=%u %s", o->wg, o->build_opts);
     err = clBuildProgram(g->prog, 1, &g->dev, opts, NULL, NULL);
     if (err != CL_SUCCESS) {

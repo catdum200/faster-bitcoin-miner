@@ -43,7 +43,7 @@ build/cmo_simd_constants.o: $(CMO)/cpuminer-config.h | build
 	$(CC) -O3 -march=native -I$(CMO) -c -o $@ $(CMO)/simd-utils/simd-constants.c
 endif
 
-.PHONY: all gen test check asan tsan clean gpu gpu-test gpu-check
+.PHONY: all gen test check asan tsan clean gpu gpu-win gpu-codeobj gpu-test gpu-check
 
 all: fbm
 
@@ -91,13 +91,28 @@ tsan:
 # mingw-w64-ucrt-x86_64-opencl-icd and -opencl-headers). The kernel sources are
 # embedded into the binary by tools/embed.c.
 GPU_CL = gpu/prelude.cl src/gen/g_rdna_nonce.h src/gen/g_rdna_vr.h gpu/kernels.cl
-GPU_OBJ = build/gpu_main.o build/gpu.o build/stats.o build/blocks.o build/sha256.o build/header.o
-OPENCL_LIBS ?= -lOpenCL
+GPU_SRC = gpu_main.c gpu.c clload.c stats.c blocks.c sha256.c header.c
+GPU_OBJ = $(GPU_SRC:%.c=build/%.o)
+# OpenCL itself is loaded at run time (src/clload.c): no SDK or import library.
+GPU_LIBS ?= -ldl
 
 gpu: fbm-gpu
 
 fbm-gpu: $(GPU_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(OPENCL_LIBS)
+	$(CC) $(CFLAGS) -o $@ $^ $(GPU_LIBS)
+
+# Windows build, cross-compiled with mingw-w64 (Debian/Ubuntu:
+# gcc-mingw-w64-x86-64, plus opencl-headers). Static, so it needs only the GPU
+# driver's OpenCL.dll. Only the Khronos CL/ headers are borrowed from the host.
+MINGW ?= x86_64-w64-mingw32-gcc
+CL_HEADERS ?= /usr/include/CL
+gpu-win: fbm-gpu.exe
+
+fbm-gpu.exe: $(GPU_SRC:%=src/%) $(wildcard src/*.h) build/gpu_sources.h build/gpu_probe_source.h
+	mkdir -p build/win-inc && cp -r $(CL_HEADERS) build/win-inc/
+	$(MINGW) -O2 -std=gnu11 -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1 \
+	    -DFBM_VERSION=\"$(GIT_VERSION)\" -Ibuild -Ibuild/win-inc -static -o $@ \
+	    $(GPU_SRC:%=src/%)
 
 build/embed: tools/embed.c | build
 	$(CC) -O2 -o $@ $<
@@ -118,10 +133,21 @@ build/gpu_main.o: INC = -DFBM_VERSION=\"$(GIT_VERSION)\"
 gpu-test: fbm-gpu
 	./fbm-gpu test
 
+# The kernels compiled by clang for gfx1200 (RX 9060 XT), exactly as
+# tools/gpu_isacheck.py audits them. `fbm-gpu --program build/fbm-gfx1200.co`
+# runs this binary where the runtime accepts clang code objects (ROCm), so the
+# ISA that runs is the audited one. Work-group size must match --wg (64).
+GPU_CLANG ?= $(shell command -v clang-20 || command -v clang-19 || command -v clang)
+gpu-codeobj: build/fbm-gfx1200.co
+build/fbm-gfx1200.co: $(GPU_CL) | build
+	cat $(GPU_CL) > build/fbm-all.cl
+	$(GPU_CLANG) -x cl -cl-std=CL1.2 -target amdgcn-amd-amdhsa -mcpu=gfx1200 -O3 -nogpulib \
+	    -DFBM_AUDIT -DFBM_WG=64 -o $@ build/fbm-all.cl
+
 # Compiles the kernels for RDNA4 (gfx1200) with clang and audits the hot
 # loops against the generator's instruction counts.
 gpu-check:
 	python3 tools/gpu_isacheck.py
 
 clean:
-	rm -rf build fbm fbm-gpu
+	rm -rf build fbm fbm-gpu fbm-gpu.exe

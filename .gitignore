@@ -6,3 +6,4 @@ __pycache__/
 bench/cpuminer-opt/src/
 bench/gpu-baselines/src/
 fbm-gpu
+/fbm-gpu.exe

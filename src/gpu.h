@@ -27,6 +27,8 @@ typedef struct {
     uint32_t hit_cap;       /* device-side candidate buffer, in (version, nonce) pairs */
     const char *build_opts; /* extra OpenCL compiler options */
     int inject_fault;       /* tests only: corrupt one job word, like a faulty card */
+    const char *program;    /* if set, a prebuilt program binary (e.g. the clang-built,
+                               audited gfx1200 code object) instead of the source */
 } fbm_gpu_opts;
 
 typedef struct fbm_gpu fbm_gpu;
