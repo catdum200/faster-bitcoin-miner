@@ -41,8 +41,9 @@ The full numbers and the method are in [`docs/RESULTS.md`](docs/RESULTS.md).
 3. [`docs/PLAN.md`](docs/PLAN.md): the revised plan. It maps every finding to
    a change, and the code follows it.
 4. [`docs/RESULTS.md`](docs/RESULTS.md): the measured outcome, including
-   where the critique was right. For example, the version-rolling gain
-   vanishes unless 64 or more versions share each nonce's schedule.
+   where the critique was right. For example, version rolling is a net
+   *loss* when only 16 versions share each nonce's schedule, and needs about
+   128 to reach its full +15%.
 
 ## How it works
 
@@ -86,7 +87,7 @@ make asan tsan       # the tests under Address/UB/Thread sanitizers
 ./fbm freq           # measured core clock for scalar / 256-bit / 512-bit code
 ./fbm bench --threads 4 --rounds 20
 ./fbm mine --header <160 hex chars> [--start N --count N --versions N --threads N]
-python3 tools/economics.py --mhs 128 --watts 30    # live network numbers
+python3 tools/economics.py --mhs 124.7 --watts 30  # live network numbers
 ```
 
 `make BASELINES=1` also fetches [cpuminer-opt](https://github.com/JayDDee/cpuminer-opt)
