@@ -6,14 +6,14 @@ only the normal AMD Adrenalin driver, which provides OpenCL.
 
 ## Provenance
 
-- **Source:** built from commit `9f4bd0a` of this repository with
+- **Source:** built from commit `8b5b422` of this repository with
   `make gpu-win`. It prints that version in `fbm-gpu.exe report`.
 - **Compiler:** mingw-w64, `x86_64-w64-mingw32-gcc (GCC) 13-win32`, Ubuntu
   24.04. Statically linked.
 - **Imports:** only `KERNEL32.dll` and `msvcrt.dll`. `OpenCL.dll` is loaded at
   run time from the driver.
 - **SHA-256:**
-  `cef3b66ec3dc42068481bec6c8f3b9991d514a8af8f4654ac437c2f76b8ac0f7`
+  `9b79677feb4ed121548e01c8db6fd6ca0d5670b35cb464fb8d936f6300f741c7`
 - **Tested here** only under Wine with PoCL, a CPU OpenCL: the full
   `fbm-gpu test` suite passes and `mine` finds block 125552. It has not run on
   a real GPU yet. That is what the report below is for.
@@ -46,3 +46,5 @@ dist\fbm-gpu.exe report --baseline poclbm130302.cl
 - Close games and videos first.
 - If any test fails, stop and send the report. A failure on a stable, stock
   card would be a bug.
+- Optional: if you have hashcat, `hashcat -b -m 1400` (SHA-256) gives an
+  independent calibration of the card's integer rate.
