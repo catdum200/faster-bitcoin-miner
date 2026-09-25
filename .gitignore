@@ -1,0 +1,5 @@
+build/
+fbm
+bench/cpuminer/cpuminer-bench
+bench/cpuminer/cpuminer-src/
+__pycache__/
