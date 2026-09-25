@@ -6,6 +6,7 @@
 
 #include "header.h"
 #include "kernels.h"
+#include "freq.h"
 #include "miner.h"
 #include "selftest.h"
 #include "sha256.h"
@@ -16,9 +17,11 @@ static void usage(void)
             "usage:\n"
             "  fbm test                         run correctness tests\n"
             "  fbm list                         list kernels and CPU support\n"
-            "  fbm bench [options]              measure hash rate of kernels\n"
-            "      --kernel NAME|all  (default all)   --threads N (default 1)\n"
-            "      --seconds S (per run, default 1)   --repeats R (default 5)\n"
+            "  fbm freq                         measure core clock for scalar/ymm/zmm code\n"
+            "  fbm bench [options]              interleaved hash-rate benchmark\n"
+            "      --kernels a,b,c|all (default all)  --threads N (default 1)\n"
+            "      --seconds S per run (default 1)    --rounds R (default 20)\n"
+            "      --baseline NAME (default cpuminer-opt16 if built, else ref)\n"
             "  fbm mine --header HEX80 [options] search for valid (version, nonce) pairs\n"
             "      --kernel NAME (default: fastest)   --threads N (default: all CPUs)\n"
             "      --start NONCE --count N (default: whole 2^32 range)\n"
@@ -40,7 +43,8 @@ static int cmd_list(void)
         const fbm_kernel *k = fbm_kernel_at(i);
         printf("%-12s %-3s %s\n", k->name, k->supported() ? "yes" : "no", k->desc);
     }
-    printf("fastest supported: %s\n", fbm_kernel_best()->name);
+    printf("fastest supported: %s (1 version per nonce), %s (64+ rolled versions)\n",
+           fbm_kernel_best(1)->name, fbm_kernel_best(FBM_VR_MAX)->name);
     return 0;
 }
 
@@ -50,85 +54,216 @@ static int cmp_double(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-/* Versions scanned per bench run: version-rolling kernels need several
- * versions per nonce to share the message schedule. */
+/* Quantile of a sorted array, linear interpolation. */
+static double quantile(const double *sorted, int n, double q)
+{
+    double pos = q * (n - 1);
+    int i = (int)pos;
+    if (i >= n - 1)
+        return sorted[n - 1];
+    return sorted[i] + (pos - i) * (sorted[i + 1] - sorted[i]);
+}
+
+static double median(const double *v, int n)
+{
+    double tmp[256];
+    memcpy(tmp, v, sizeof(double) * n);
+    qsort(tmp, n, sizeof(double), cmp_double);
+    return quantile(tmp, n, 0.5);
+}
+
+/* Percentile bootstrap 95% CI of the median of v (resampling runs). */
+static void bootstrap_ci(const double *v, int n, double *lo, double *hi)
+{
+    enum { B = 2000 };
+    static double meds[B];
+    double tmp[256];
+    uint64_t s = 0x9e3779b97f4a7c15ull;
+    for (int b = 0; b < B; b++) {
+        for (int i = 0; i < n; i++) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            tmp[i] = v[s % (uint64_t)n];
+        }
+        meds[b] = median(tmp, n);
+    }
+    qsort(meds, B, sizeof(double), cmp_double);
+    *lo = quantile(meds, B, 0.025);
+    *hi = quantile(meds, B, 0.975);
+}
+
+static int cmd_freq(void)
+{
+    printf("core clock (GHz), dependent-add chains:\n");
+    printf("  scalar           %.2f\n", fbm_ghz_scalar());
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2"))
+        printf("  256-bit (ymm)    %.2f\n", fbm_ghz_ymm());
+    if (__builtin_cpu_supports("avx512f"))
+        printf("  512-bit (zmm)    %.2f\n", fbm_ghz_zmm());
+    return 0;
+}
+
+/* Versions scanned per run: version-rolling kernels need several versions
+ * per nonce to share the message schedule. */
 static uint32_t bench_versions(const fbm_kernel *k)
 {
     return k->vr ? 128 : 1;
 }
 
+#define MAX_ROUNDS 200
+
+typedef struct {
+    const fbm_kernel *k;
+    char label[48];
+    uint32_t nr;
+    uint64_t nn; /* nonces per thread per run */
+    double rate[MAX_ROUNDS]; /* MH/s, all threads */
+} bench_entry;
+
+static double bench_once(bench_entry *e, const fbm_job *job, int threads)
+{
+    fbm_hit buf[64];
+    fbm_hits hits = {buf, 64, 0};
+    fbm_run_stats st = fbm_run(e->k, job, 0, e->nr, 0, e->nn * threads, threads, &hits);
+    return st.hashes / st.seconds / 1e6;
+}
+
+/* Interleaved benchmark: every round runs each kernel once (in rotating
+ * order) so slow drifts and noisy neighbours hit all kernels alike. Speedups
+ * are medians of per-round ratios with bootstrap 95% CIs. */
 static int cmd_bench(int argc, char **argv)
 {
-    const char *which = arg_value(argc, argv, "--kernel", "all");
+    const char *which = arg_value(argc, argv, "--kernels", arg_value(argc, argv, "--kernel", "all"));
     int threads = atoi(arg_value(argc, argv, "--threads", "1"));
     double seconds = atof(arg_value(argc, argv, "--seconds", "1"));
-    int repeats = atoi(arg_value(argc, argv, "--repeats", "5"));
+    int rounds = atoi(arg_value(argc, argv, "--rounds", "20"));
+    const char *base_name = arg_value(argc, argv, "--baseline", NULL);
+    static bench_entry es[32];
+    int ne = 0;
     fbm_job job;
-    double ref_rate = 0;
 
-    if (threads < 1 || repeats < 1 || repeats > 99 || seconds <= 0) {
+    if (threads < 1 || rounds < 1 || rounds > MAX_ROUNDS || seconds <= 0) {
         usage();
         return 2;
     }
+    /* The list is either "all" or comma-separated names; "name@N" runs a
+     * kernel with N rolled versions per nonce (default 128 for
+     * version-rolling kernels, else 1). */
+    char list[1024];
+    snprintf(list, sizeof list, "%s", which);
+    for (char *tok = strtok(list, ","); tok && ne < 32; tok = strtok(NULL, ",")) {
+        char *at = strchr(tok, '@');
+        uint32_t nr = 0;
+        if (at) {
+            *at = '\0';
+            nr = (uint32_t)strtoul(at + 1, NULL, 0);
+        }
+        for (size_t i = 0; i < fbm_kernel_count() && ne < 32; i++) {
+            const fbm_kernel *k = fbm_kernel_at(i);
+            if (strcmp(tok, "all") != 0 && strcmp(tok, k->name) != 0)
+                continue;
+            if (!k->supported()) {
+                printf("skipping %s: not supported on this CPU\n", k->name);
+                continue;
+            }
+            es[ne].k = k;
+            es[ne].nr = nr ? nr : bench_versions(k);
+            if (es[ne].nr > FBM_VR_MAX) {
+                fprintf(stderr, "too many versions\n");
+                return 2;
+            }
+            snprintf(es[ne].label, sizeof es[ne].label, "%s%s%s", k->name, at ? "@" : "",
+                     at ? at + 1 : "");
+            ne++;
+        }
+    }
+    if (ne == 0) {
+        fprintf(stderr, "no kernels selected\n");
+        return 2;
+    }
+    int base = -1;
+    for (int i = 0; i < ne; i++) {
+        if (base_name ? !strcmp(es[i].label, base_name)
+                      : (!strcmp(es[i].k->name, "cpuminer-opt16") ||
+                         (base < 0 && !strcmp(es[i].k->name, "ref"))))
+            base = i;
+    }
+
     /* A fixed pseudo-random header; t7 = 0 as for any real network target. */
     for (int i = 0; i < 80; i++)
         job.header[i] = (uint8_t)(i * 37 + 11);
     job.t7 = 0;
 
-    printf("%-12s %7s %12s %22s %14s %9s\n", "kernel", "threads", "MH/s(median)", "min..max",
-           "cycles/hash*", "vs ref");
-    for (size_t i = 0; i < fbm_kernel_count(); i++) {
-        const fbm_kernel *k = fbm_kernel_at(i);
-        if (strcmp(which, "all") != 0 && strcmp(which, k->name) != 0)
-            continue;
-        if (!k->supported()) {
-            printf("%-12s (not supported on this CPU)\n", k->name);
-            continue;
-        }
-        uint32_t nr = bench_versions(k);
-        fbm_hit buf[256];
-        fbm_hits hits = {buf, 256, 0};
+    double ghz[3] = {fbm_ghz_scalar(), 0, 0};
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2"))
+        ghz[1] = fbm_ghz_ymm();
+    if (__builtin_cpu_supports("avx512f"))
+        ghz[2] = fbm_ghz_zmm();
+    printf("threads %d, %d interleaved rounds of ~%.2f s per kernel; core GHz: scalar %.2f, "
+           "ymm %.2f, zmm %.2f\n",
+           threads, rounds, seconds, ghz[0], ghz[1], ghz[2]);
 
-        /* Calibrate the nonce count so one run takes about `seconds`. */
-        uint64_t nn = 1024;
-        fbm_run_stats st;
+    /* Calibrate each kernel's run length, which doubles as a warm-up. */
+    for (int i = 0; i < ne; i++) {
+        es[i].nn = 256;
         for (;;) {
-            st = fbm_run(k, &job, 0, nr, 0, nn * threads, threads, &hits);
-            if (st.seconds > 0.05 || nn * nr * threads > (1ull << 40))
+            fbm_hit buf[64];
+            fbm_hits hits = {buf, 64, 0};
+            fbm_run_stats st = fbm_run(es[i].k, &job, 0, es[i].nr, 0, es[i].nn * threads, threads,
+                                       &hits);
+            if (st.seconds > 0.1 || es[i].nn >= (1ull << 31) / threads) {
+                double per = st.seconds / (double)es[i].nn;
+                es[i].nn = (uint64_t)(seconds / per);
                 break;
-            nn *= 4;
+            }
+            es[i].nn *= 4;
         }
-        double per_nonce = st.seconds / (double)(nn * threads);
-        nn = (uint64_t)(seconds / per_nonce / threads);
-        if (nn * threads > 0xffffffffull)
-            nn = 0xffffffffull / threads;
-        if (nn < 64)
-            nn = 64;
-
-        double rates[99], cycles[99];
-        for (int r = 0; r < repeats; r++) {
-            hits.n = 0;
-            st = fbm_run(k, &job, 0, nr, 0, nn * threads, threads, &hits);
-            rates[r] = st.hashes / st.seconds / 1e6;
-            cycles[r] = (double)st.tsc * threads / st.hashes;
-        }
-        double sorted[99];
-        memcpy(sorted, rates, sizeof(double) * repeats);
-        qsort(sorted, repeats, sizeof(double), cmp_double);
-        qsort(cycles, repeats, sizeof(double), cmp_double);
-        double med = sorted[repeats / 2];
-        if (strcmp(k->name, "ref") == 0)
-            ref_rate = med;
-        char range[64], rel[32] = "";
-        snprintf(range, sizeof range, "%.3f..%.3f", sorted[0], sorted[repeats - 1]);
-        if (ref_rate > 0)
-            snprintf(rel, sizeof rel, "%.1fx", med / ref_rate);
-        printf("%-12s %7d %12.3f %22s %14.0f %9s\n", k->name, threads, med, range,
-               cycles[repeats / 2], rel);
-        fflush(stdout);
+        if (es[i].nn * threads > 0xffffffffull)
+            es[i].nn = 0xffffffffull / threads;
+        es[i].nn = es[i].nn < 64 ? 64 : es[i].nn;
     }
-    printf("* TSC ticks (%s) x threads / hashes: cost of one hash on one core\n",
-           "constant-rate timestamp counter");
+
+    for (int r = 0; r < rounds; r++) {
+        for (int j = 0; j < ne; j++) {
+            int i = (j + r) % ne;
+            es[i].rate[r] = bench_once(&es[i], &job, threads);
+        }
+        fprintf(stderr, "\rround %d/%d", r + 1, rounds);
+    }
+    fprintf(stderr, "\r                \r");
+
+    printf("| kernel | MH/s median | IQR | min..max | ns/hash/core | ~core cycles/hash |");
+    if (base >= 0)
+        printf(" vs %s [95%% CI] |", es[base].label);
+    printf("\n|---|---:|---:|---:|---:|---:|%s\n", base >= 0 ? "---:|" : "");
+    for (int i = 0; i < ne; i++) {
+        double sorted[MAX_ROUNDS];
+        memcpy(sorted, es[i].rate, sizeof(double) * rounds);
+        qsort(sorted, rounds, sizeof(double), cmp_double);
+        double med = quantile(sorted, rounds, 0.5);
+        double ns = threads * 1e3 / med; /* ns per hash per core */
+        int low = 0;
+        for (int r = 0; r < rounds; r++)
+            low += es[i].rate[r] < 0.8 * med;
+        printf("| %s | %.3f | %.3f..%.3f | %.3f..%.3f | %.2f | %.0f |", es[i].label, med,
+               quantile(sorted, rounds, 0.25), quantile(sorted, rounds, 0.75), sorted[0],
+               sorted[rounds - 1], ns, ns * ghz[es[i].k->isa]);
+        if (base >= 0) {
+            double ratio[MAX_ROUNDS], lo, hi;
+            for (int r = 0; r < rounds; r++)
+                ratio[r] = es[i].rate[r] / es[base].rate[r];
+            bootstrap_ci(ratio, rounds, &lo, &hi);
+            printf(" %.3fx [%.3f, %.3f] |", median(ratio, rounds), lo, hi);
+        }
+        if (low)
+            printf(" (%d run(s) < 80%% of median)", low);
+        printf("\n");
+    }
+    printf("\nns/hash/core = threads / rate. ~core cycles/hash = ns/hash/core x measured core GHz\n"
+           "for the kernel's widest vectors (scalar, ymm or zmm license).\n");
     return 0;
 }
 
@@ -157,7 +292,7 @@ static int cmd_mine(int argc, char **argv)
         fprintf(stderr, "bad nonce or version range\n");
         return 2;
     }
-    const fbm_kernel *k = kname ? fbm_kernel_find(kname) : fbm_kernel_best();
+    const fbm_kernel *k = kname ? fbm_kernel_find(kname) : fbm_kernel_best(versions);
     if (!k || !k->supported()) {
         fprintf(stderr, "unknown or unsupported kernel\n");
         return 2;
@@ -181,14 +316,24 @@ static int cmd_mine(int argc, char **argv)
         fbm_header_set(hdr, FBM_OFF_VERSION, hits.v[i].version);
         fbm_header_set(hdr, FBM_OFF_NONCE, hits.v[i].nonce);
         fbm_sha256d(hdr, 80, hash);
+        if (fbm_top32_le(hash) > job.t7) {
+            /* The kernel's filter is exact, so this can only be a kernel bug
+             * (e.g. byte order), which could also be dropping real blocks. */
+            fprintf(stderr, "BUG: kernel %s reported version 0x%08x nonce %u, which fails its own "
+                    "pre-filter; aborting\n", k->name, hits.v[i].version, hits.v[i].nonce);
+            return 3;
+        }
         if (fbm_cmp256_le(hash, target) > 0)
-            continue; /* passed the 32-bit pre-filter but not the full target */
+            continue; /* top 32 bits pass, full 256-bit target does not */
         solutions++;
         fbm_hash_display(hash, disp);
         fbm_hex_encode(hdr, 80, full);
         printf("SOLUTION version=0x%08x nonce=%u hash=%s\n  header=%s\n", hits.v[i].version,
                hits.v[i].nonce, disp, full);
     }
+    if (hits.n > hits.cap)
+        fprintf(stderr, "warning: %zu candidates found but only %zu checked (buffer full); "
+                "narrow the range\n", hits.n, hits.cap);
     printf("%llu hashes in %.3f s = %.3f MH/s, %d solution(s), %zu candidate(s)\n",
            (unsigned long long)st.hashes, st.seconds, st.hashes / st.seconds / 1e6, solutions,
            hits.n);
@@ -205,6 +350,8 @@ int main(int argc, char **argv)
         return fbm_selftest();
     if (strcmp(argv[1], "list") == 0)
         return cmd_list();
+    if (strcmp(argv[1], "freq") == 0)
+        return cmd_freq();
     if (strcmp(argv[1], "bench") == 0)
         return cmd_bench(argc - 1, argv + 1);
     if (strcmp(argv[1], "mine") == 0)

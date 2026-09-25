@@ -14,7 +14,8 @@ typedef struct {
 
 /* Hash (r0..r0+nr) x (n0..n0+nn) with `threads` threads, each owning a
  * contiguous slice of the nonce range. Candidates from all threads are
- * appended to *out. Threads are pinned to CPUs 0..threads-1 when possible. */
+ * appended to *out; if more are found than out->cap, out->n still counts
+ * them all. Threads are pinned to CPUs 0..threads-1 when possible. */
 fbm_run_stats fbm_run(const fbm_kernel *k, const fbm_job *job, uint32_t r0, uint32_t nr, uint32_t n0,
                       uint64_t nn, int threads, fbm_hits *out);
 

@@ -7,8 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <openssl/sha.h>
+
 #include "header.h"
 #include "kernels.h"
+#include "miner.h"
 #include "sha256.h"
 #include "util.h"
 
@@ -181,42 +184,115 @@ static void test_kernels_differential(void)
     diff_case("production t7=0", &job, 0, 16, 0, 1 << 14);
 }
 
-/* Each kernel must rediscover the real nonce (and only valid candidates). */
+/* Mainnet blocks whose versions have BIP 320 bits rolled by the ASIC that
+ * mined them: heights 800000-910000 and three from September 2026 (ViaBTC,
+ * Braiins Pool, MARA Pool). Hashes were checked against mempool.space. */
+static const char *const recent_blocks[][2] = {
+    {"800000", "00601d3455bb9fbd966b3ea2dc42d0c22722e4c0c1729fad172101000000000000000000550"
+               "87fab0c8f3f89f8bcfd4df26c504d81b0a88e04907161838c0c53001af09135edbd64943805175e955e06"},
+    {"850000", "0080bb2b13b3152752d9cf2a36fcd16d78f64269d847932f076b02000000000000000000d51"
+               "a6bd669cf6bc30269a259c2918e6319269fc15f020a82ddd6a5fdc1f5cf71ca618066255d03176ab0fb7c"},
+    {"900000", "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f"
+               "96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92"},
+    {"910000", "00a0572be06d4f01a2ed2228dec965539cc8b96512ccde7d2824010000000000000000006f2"
+               "8c30dc748f6b1430fb2b9a5a94b5b34a5df6e318c6cc5c310a1a35b432b59a3ab9d68b32c021719d103e9"},
+    {"968566", "0000003874fd1f0f0ea2296a90502e569622d8e3bc1f8d201d650000000000000000000001c20b8594f8"
+               "5b5e3d92e4a66ac4f2864913fcd8b44c4a3bbf7da256378081ec2fa1b66ac51e02177b22a039"},
+    {"968562", "0060aa297152dfd5bda8f97830a47df977bf41a6254159cc0366000000000000000000008abded7270cd"
+               "1dfde5a3cfd286b8a1787980c006b9f35b8f47146dc68abdbac0ef95b66ac51e021718227e7a"},
+    {"968555", "00607925ad9b791fcca5e6d220cd922225cc79e7811a78d775110000000000000000000033382e41f38a"
+               "d364b21b717a3baa7cdf34e834c52bbcd3f800d785aeac3539ff6a7eb66ac51e021748202491"},
+};
+
+/* Each kernel must rediscover the real (version, nonce) of real blocks. The
+ * job's base version is the real one XOR (5 << 13), so the solution sits at
+ * rolled-version index r = 5 of the 16 scanned: this checks the BIP 320
+ * version mapping as well as the hashing. */
 static void test_kernels_known(void)
 {
-    const struct {
-        const char *name, *hex;
-    } blocks[] = {{"genesis", fbm_genesis_hex}, {"125552", fbm_block125552_hex}};
-    printf("kernels rediscover real block nonces\n");
-    for (size_t b = 0; b < 2; b++) {
+    const char *names[16], *hexes[16];
+    size_t nblocks = 0;
+    names[nblocks] = "genesis";
+    hexes[nblocks++] = fbm_genesis_hex;
+    names[nblocks] = "125552";
+    hexes[nblocks++] = fbm_block125552_hex;
+    for (size_t i = 0; i < sizeof recent_blocks / sizeof recent_blocks[0]; i++) {
+        names[nblocks] = recent_blocks[i][0];
+        hexes[nblocks++] = recent_blocks[i][1];
+    }
+    printf("kernels rediscover real (version, nonce) of %zu mainnet blocks\n", nblocks);
+    for (size_t b = 0; b < nblocks; b++) {
         fbm_job job;
-        uint8_t target[32];
-        fbm_hex_decode(blocks[b].hex, job.header, 80);
+        uint8_t target[32], hash[32];
+        fbm_hex_decode(hexes[b], job.header, 80);
+        fbm_sha256d(job.header, 80, hash);
         fbm_bits_to_target(fbm_header_get(job.header, FBM_OFF_BITS), target);
+        CHECK(fbm_cmp256_le(hash, target) <= 0, "%s: header does not meet its target", names[b]);
         job.t7 = fbm_top32_le(target);
         const uint32_t nonce = fbm_header_get(job.header, FBM_OFF_NONCE);
         const uint32_t version = fbm_header_get(job.header, FBM_OFF_VERSION);
+        fbm_header_set(job.header, FBM_OFF_VERSION, fbm_rolled_version(version, 5));
         for (size_t i = 0; i < fbm_kernel_count(); i++) {
             const fbm_kernel *k = fbm_kernel_at(i);
             if (!k->supported())
                 continue;
-            /* Version-lane kernels scan 16 versions; r = 0 is the real one. */
-            uint32_t nr = k->version_lanes > 1 ? 16 : 1;
-            fbm_hits h = run(k, &job, 0, nr, nonce - 3000, 5000);
+            fbm_hits h = run(k, &job, 0, 16, nonce - 3000, 5000);
             int found = 0;
             for (size_t j = 0; j < h.n && j < h.cap; j++) {
-                uint8_t hdr[80], hash[32];
+                uint8_t hdr[80];
                 memcpy(hdr, job.header, 80);
                 fbm_header_set(hdr, FBM_OFF_VERSION, h.v[j].version);
                 fbm_header_set(hdr, FBM_OFF_NONCE, h.v[j].nonce);
                 fbm_sha256d(hdr, 80, hash);
-                CHECK(fbm_top32_le(hash) <= job.t7, "%s/%s: bogus candidate", blocks[b].name, k->name);
+                CHECK(fbm_top32_le(hash) <= job.t7, "%s/%s: bogus candidate", names[b], k->name);
                 if (h.v[j].nonce == nonce && h.v[j].version == version)
                     found = 1;
             }
-            CHECK(found, "%s: kernel %s missed nonce %u", blocks[b].name, k->name, nonce);
+            CHECK(found, "%s: kernel %s missed version 0x%08x nonce %u", names[b], k->name, version,
+                  nonce);
             free(h.v);
         }
+    }
+}
+
+/* fbm_run must cover a range exactly once however it splits it. */
+static void test_partition(void)
+{
+    const char *names[] = {"scalar", "scalar-vr", "avx2", "avx512", "avx512-vr"};
+    const fbm_kernel *ref = fbm_kernel_find("ref");
+    fbm_job job;
+    printf("thread partitioning covers the range exactly once\n");
+    random_job(&job, 0x03ffffff); /* ~1/64 */
+    fbm_hits want = run(ref, &job, 2, 16, 4000000000u, 20011);
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        const fbm_kernel *k = fbm_kernel_find(names[i]);
+        if (!k || !k->supported())
+            continue;
+        for (int threads = 1; threads <= 7; threads += 3) {
+            fbm_hits got = {calloc(1u << 16, sizeof(fbm_hit)), 1u << 16, 0};
+            fbm_run_stats st = fbm_run(k, &job, 2, 16, 4000000000u, 20011, threads, &got);
+            qsort(got.v, got.n < got.cap ? got.n : got.cap, sizeof(fbm_hit), hit_cmp);
+            int same = st.hashes == 16ull * 20011 && got.n == want.n &&
+                       !memcmp(got.v, want.v, want.n * sizeof(fbm_hit));
+            CHECK(same, "%s with %d threads: %zu candidates, %llu hashes (want %zu)", k->name,
+                  threads, got.n, (unsigned long long)st.hashes, want.n);
+            free(got.v);
+        }
+    }
+    free(want.v);
+}
+
+/* The reference SHA-256 must agree with OpenSSL on every length. */
+static void test_sha256_vs_openssl(void)
+{
+    uint8_t msg[300], a[32], b[32];
+    printf("sha256 vs OpenSSL, lengths 0..299\n");
+    for (size_t len = 0; len < sizeof msg; len++) {
+        for (size_t i = 0; i < len; i++)
+            msg[i] = (uint8_t)rng32();
+        fbm_sha256(msg, len, a);
+        SHA256(msg, len, b);
+        CHECK(!memcmp(a, b, 32), "length %zu differs from OpenSSL", len);
     }
 }
 
@@ -224,9 +300,11 @@ int fbm_selftest(void)
 {
     failures = 0;
     test_sha256();
+    test_sha256_vs_openssl();
     test_blocks();
     test_kernels_differential();
     test_kernels_known();
+    test_partition();
     printf(failures ? "%d FAILURE(S)\n" : "all tests passed\n", failures);
     return failures ? 1 : 0;
 }

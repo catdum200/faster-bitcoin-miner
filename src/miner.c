@@ -59,8 +59,9 @@ fbm_run_stats fbm_run(const fbm_kernel *k, const fbm_job *job, uint32_t r0, uint
         ws[t].n0 = (uint32_t)(n0 + start);
         ws[t].nn = start >= nn ? 0 : (nn - start < slice ? nn - start : slice);
         ws[t].cpu = threads <= ncpu ? t : -1;
-        ws[t].hits.cap = 4096;
-        ws[t].hits.v = calloc(ws[t].hits.cap, sizeof(fbm_hit));
+        /* Each worker can hold everything the caller can. */
+        ws[t].hits.cap = out->cap;
+        ws[t].hits.v = calloc(out->cap ? out->cap : 1, sizeof(fbm_hit));
     }
 
     double t0 = now();
@@ -77,6 +78,9 @@ fbm_run_stats fbm_run(const fbm_kernel *k, const fbm_job *job, uint32_t r0, uint
         size_t stored = ws[t].hits.n < ws[t].hits.cap ? ws[t].hits.n : ws[t].hits.cap;
         for (size_t i = 0; i < stored; i++)
             fbm_hits_push(out, ws[t].hits.v[i].version, ws[t].hits.v[i].nonce);
+        /* Count candidates a worker could not store, so the caller sees
+         * out->n > out->cap instead of a silently short list. */
+        out->n += ws[t].hits.n - stored;
         free(ws[t].hits.v);
     }
     free(ws);

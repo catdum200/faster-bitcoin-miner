@@ -238,12 +238,21 @@ class Gen:
 
     def rounds(self, state, W, t_from, t_to):
         a, b, c, d, e, f, g, h = state
+        hk = add(h, K[t_from], W[t_from])
         for t in range(t_from, t_to):
-            t1 = add(h, self.op('bsig1', e), self.ch(e, f, g), K[t], W[t])
+            # g becomes the next round's h. Adding it into that round's
+            # h + K + W *before* Ch makes Ch its last use, so vpternlogd can
+            # overwrite g instead of needing a register copy.
+            if t + 1 < t_to and self.mat(g).kind == VAR:
+                hk_next = self.mat(add(g, K[t + 1], W[t + 1]))
+            else:
+                hk_next = add(g, K[t + 1], W[t + 1]) if t + 1 < t_to else None
+            t1 = add(hk, self.op('bsig1', e), self.ch(e, f, g))
             if sum(1 for x in terms_of(t1)[0] if x.kind == VAR) >= 2:
                 t1 = self.mat(t1)  # shared by e and a: compute once
             t2 = add(self.op('bsig0', a), self.maj(a, b, c))
             h, g, f, e, d, c, b, a = g, f, e, add(d, t1), c, b, a, add(t1, t2)
+            hk = hk_next
         return [a, b, c, d, e, f, g, h]
 
 

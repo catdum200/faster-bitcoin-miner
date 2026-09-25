@@ -65,12 +65,16 @@ typedef struct {
     uint32_t version_lanes;
     /* 1 if the kernel shares one block-2 schedule across versions. */
     int vr;
+    /* Widest vectors used, which sets the core clock it runs at. */
+    enum { FBM_ISA_SCALAR, FBM_ISA_YMM, FBM_ISA_ZMM } isa;
 } fbm_kernel;
 
 size_t fbm_kernel_count(void);
 const fbm_kernel *fbm_kernel_at(size_t i);
 const fbm_kernel *fbm_kernel_find(const char *name);
-/* Fastest kernel supported by the running CPU. */
-const fbm_kernel *fbm_kernel_best(void);
+/* Fastest kernel supported by the running CPU for a search that rolls
+ * `versions` versions per nonce: version-lane kernels only pay off with
+ * many versions per nonce (64+ measured), otherwise nonce-lane kernels. */
+const fbm_kernel *fbm_kernel_best(uint32_t versions);
 
 #endif
