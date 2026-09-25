@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "rdna_scalar.h"
+#include "gpu_probe_source.h"
 #include "gpu_sources.h" /* build/: the OpenCL sources, embedded by tools/embed.c */
 
 /* Must match gpu/kernels.cl. */
@@ -289,7 +290,6 @@ void fbm_gpu_info(fbm_gpu *g, FILE *out)
     char s[256] = "";
     cl_uint cu = 0, mhz = 0;
     cl_ulong mem = 0;
-    fprintf(out, "device: %s\n", g->name);
     clGetDeviceInfo(g->dev, CL_DEVICE_VENDOR, sizeof s, s, NULL);
     fprintf(out, "  vendor: %s\n", s);
     clGetDeviceInfo(g->dev, CL_DEVICE_VERSION, sizeof s, s, NULL);
@@ -516,6 +516,81 @@ static uint64_t scan_vr(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t nr
     }
     collect(g, FBM_GPU_VR, (double)nrp * nn, out, base, r0);
     return (uint64_t)nr * nn;
+}
+
+/* ---- issue-rate probes ---------------------------------------------------- */
+
+static double run_probe(fbm_gpu *g, cl_kernel k, size_t global, uint32_t iters)
+{
+    const size_t local = 64;
+    cl_event ev;
+    cl_ulong t0 = 0, t1 = 0;
+    set_u32(k, 0, iters);
+    set_u32(k, 1, 12345);
+    set_mem(k, 2, g->job);
+    CL_OK(clEnqueueNDRangeKernel(g->q, k, 1, NULL, &global, &local, 0, NULL, &ev));
+    CL_OK(clWaitForEvents(1, &ev));
+    clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof t0, &t0, NULL);
+    clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof t1, &t1, NULL);
+    clReleaseEvent(ev);
+    return (double)(t1 - t0) * 1e-9;
+}
+
+int fbm_gpu_probe(fbm_gpu *g, FILE *out)
+{
+    static const char *const names[] = {"probe_add", "probe_alignbit", "probe_xor3",
+                                        "probe_add3", "probe_bfi", "probe_xad",
+                                        "probe_mix_salu", "probe_mix_delay"};
+    enum { N = sizeof names / sizeof names[0] };
+    cl_int err;
+    cl_uint cu = 1;
+    clGetDeviceInfo(g->dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof cu, &cu, NULL);
+    cl_program p = clCreateProgramWithSource(g->ctx, fbm_gpu_probe_src_COUNT,
+                                             (const char **)fbm_gpu_probe_src, NULL, &err);
+    CL_OK(err);
+    if (clBuildProgram(p, 1, &g->dev, "-cl-std=CL1.2", NULL, NULL) != CL_SUCCESS) {
+        fprintf(out, "the probe program does not build on this device (inline asm?)\n");
+        clReleaseProgram(p);
+        return -1;
+    }
+    /* 256 work-groups of 64 per compute unit, so every SIMD has many waves
+     * to pick from, as in the mining kernels. */
+    const size_t global = (size_t)cu * 64 * 256;
+    double secs[N], ops[N];
+    for (int i = 0; i < N; i++) {
+        cl_kernel k = clCreateKernel(p, names[i], &err);
+        CL_OK(err);
+        uint32_t iters = 4;
+        double t = run_probe(g, k, global, iters); /* warm-up and calibration */
+        while (t < 0.05 && iters < (1u << 24)) {
+            iters *= 4;
+            t = run_probe(g, k, global, iters);
+        }
+        double best = t;
+        for (int r = 0; r < 4; r++) {
+            t = run_probe(g, k, global, iters);
+            best = t < best ? t : best;
+        }
+        secs[i] = best;
+        ops[i] = (double)global * iters * 64; /* VALU lane-ops (the mixes add non-VALU) */
+        clReleaseKernel(k);
+    }
+    clReleaseProgram(p);
+    const double add = ops[0] / secs[0];
+    fprintf(out, "| probe (64 instructions per iteration) | VALU lane-ops/s | rate vs v_add |\n"
+            "|---|---:|---:|\n");
+    for (int i = 0; i < N; i++)
+        fprintf(out, "| %s | %.3g | %.3f |\n", names[i], ops[i] / secs[i], ops[i] / secs[i] / add);
+    fprintf(out, "\nv_add_nc_u32 runs at %.3g lane-ops/s. If it is full rate (32 lanes per SIMD\n"
+            "per clock), the shader clock is %.2f GHz with 64 lanes per reported compute unit\n"
+            "(%u reported), or %.2f GHz if the driver reports dual-CU WGPs. For an RX 9060 XT\n"
+            "(2048 lanes) that is %.2f GHz.\n", add, add / (64.0 * cu) * 1e-9, cu,
+            add / (128.0 * cu) * 1e-9, add / 2048 * 1e-9);
+    fprintf(out, "probe_mix_salu adds 64 s_xor_b32 and probe_mix_delay 64 s_delay_alu to the 64\n"
+            "v_add of each iteration. A rate near 1.0 means those instructions are free (they\n"
+            "take no vector issue slot); near 0.5 means each costs one. This decides whether\n"
+            "the vr kernel's gain is nearer 1.17x or 1.10x.\n");
+    return 0;
 }
 
 uint64_t fbm_gpu_scan(fbm_gpu *g, fbm_gpu_layout layout, const fbm_job *job, uint32_t r0,

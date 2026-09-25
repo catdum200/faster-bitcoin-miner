@@ -14,6 +14,10 @@
 #include "sha256.h"
 #include "stats.h"
 
+#ifndef FBM_VERSION
+#define FBM_VERSION "unknown"
+#endif
+
 static const char *const layout_name[] = {"nonce", "vr"};
 
 static void usage(void)
@@ -32,6 +36,11 @@ static void usage(void)
             "      --kernel nonce|vr   --seconds S (stop after S seconds; Ctrl-C also stops)\n"
             "  fbm-gpu dump --out FILE           save the driver-compiled kernels (AMD: ELF,\n"
             "                                    for tools/gpu_isacheck.py)\n"
+            "  fbm-gpu probe                     per-instruction issue rates (GPU clock probe)\n"
+            "  fbm-gpu sustain [--kernel vr|nonce] [--seconds S]  long run, logs rate and, on\n"
+            "                                    Linux, board power and clock (J/TH)\n"
+            "  fbm-gpu report [--out FILE] [--sustain S]  everything above in one file, to\n"
+            "                                    send back (default: fbm-gpu-report.txt)\n"
             "common options:\n"
             "  --platform P --device D           pick a device (default: first GPU)\n"
             "  --wg N                            work-group size (default 64)\n"
@@ -170,7 +179,7 @@ static void diff_case(fbm_gpu *g, const char *label, const fbm_job *job, uint32_
               want.n);
         free(got.v);
     }
-    printf("  %-34s %zu candidates\n", label, want.n);
+    printf("  %-38s %zu candidates\n", label, want.n);
     free(want.v);
 }
 
@@ -302,11 +311,49 @@ static void test_canary(fbm_gpu *g)
     }
 }
 
-static int cmd_test(int argc, char **argv)
+/* Production geometry: the measured launch sizes (several launches per
+ * scan), the answer at the highest version index and at the last nonce of
+ * the range, so the last work-group of the last launch must find it. */
+static void test_planted(fbm_gpu *g)
 {
-    fbm_gpu *g = open_from_args(argc, argv);
-    if (!g)
-        return 2;
+    printf("planted answers at production geometry (last version index, last nonce)\n");
+    for (int layout = 0; layout < 2; layout++) {
+        /* genesis for the nonce layout (a large nonce leaves room below it),
+         * block 800000 (rolled version) for the version layout */
+        const fbm_known_block *b = &fbm_known_blocks[layout == FBM_GPU_VR ? 2 : 0];
+        fbm_job job;
+        uint8_t target[32];
+        fbm_hex_decode(b->hex, job.header, 80);
+        fbm_bits_to_target(fbm_header_get(job.header, FBM_OFF_BITS), target);
+        job.t7 = fbm_top32_le(target);
+        const uint32_t nonce = fbm_header_get(job.header, FBM_OFF_NONCE);
+        const uint32_t version = fbm_header_get(job.header, FBM_OFF_VERSION);
+        const uint32_t top = FBM_VR_MAX - 1;
+        fbm_header_set(job.header, FBM_OFF_VERSION, fbm_rolled_version(version, top));
+        /* ~0.3 s of work at the measured rate, at least a few launches */
+        double want = fbm_gpu_rate(g, (fbm_gpu_layout)layout) * 0.3;
+        uint32_t r0 = layout == FBM_GPU_VR ? 0 : top, nr = layout == FBM_GPU_VR ? FBM_VR_MAX : 1;
+        uint64_t nn = (uint64_t)(want / nr);
+        const uint64_t lo = layout == FBM_GPU_VR ? 64 : 1u << 20;
+        const uint64_t hi = layout == FBM_GPU_VR ? 4096 : 1u << 30;
+        nn = nn < lo ? lo : nn > hi ? hi : nn;
+        nn = nn > (uint64_t)nonce + 1 ? (uint64_t)nonce + 1 : nn;
+        fbm_hits h = new_hits(4096);
+        fbm_gpu_scan(g, (fbm_gpu_layout)layout, &job, r0, nr, nonce - (uint32_t)(nn - 1), nn, &h);
+        int found = 0;
+        for (size_t j = 0; j < h.n && j < h.cap; j++)
+            found |= h.v[j].nonce == nonce && h.v[j].version == version;
+        CHECK(found, "%s: missed the answer at version index %u, nonce %u (last of %llu)",
+              layout_name[layout], top, nonce, (unsigned long long)nn);
+        printf("  %-5s %s: %u versions x %llu nonces, answer found: %s\n", layout_name[layout],
+               b->name, nr, (unsigned long long)nn, found ? "yes" : "NO");
+        free(h.v);
+    }
+}
+
+/* Every test; returns the number of failures. */
+static int run_tests(fbm_gpu *g)
+{
     fbm_gpu_opts *o = fbm_gpu_options(g);
     failures = 0;
     test_differential(g, "default launch sizes");
@@ -319,14 +366,32 @@ static int cmd_test(int argc, char **argv)
     test_differential(g, "tiny launches (1000 hashes, 3 and 7 nonces per work-item)");
     *o = saved;
     test_known(g);
+    test_planted(g);
     test_overflow(g);
     test_canary(g);
     printf(failures ? "%d FAILURE(S)\n" : "all GPU tests passed\n", failures);
+    return failures;
+}
+
+static int cmd_test(int argc, char **argv)
+{
+    fbm_gpu *g = open_from_args(argc, argv);
+    if (!g)
+        return 2;
+    const int f = run_tests(g);
     fbm_gpu_close(g);
-    return failures ? 1 : 0;
+    return f ? 1 : 0;
 }
 
 /* ---- bench --------------------------------------------------------------- */
+
+static volatile sig_atomic_t stop_requested;
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    stop_requested = 1;
+}
 
 #define MAX_ROUNDS 200
 
@@ -349,32 +414,21 @@ static double bench_once(fbm_gpu *g, bench_entry *e, const fbm_job *job, double 
     return n / dt / 1e6;
 }
 
-static int cmd_bench(int argc, char **argv)
+/* Interleaved rounds, each running every selected layout once in rotating
+ * order; the vr / nonce ratio is a median of per-round ratios with a
+ * bootstrap 95% CI. */
+static int run_bench(fbm_gpu *g, const char *which, int rounds, double seconds, uint32_t versions)
 {
-    const char *which = arg_value(argc, argv, "--kernels", "nonce,vr");
-    int rounds = atoi(arg_value(argc, argv, "--rounds", "10"));
-    double seconds = atof(arg_value(argc, argv, "--seconds", "2"));
-    uint32_t versions = (uint32_t)strtoul(arg_value(argc, argv, "--versions", "65536"), NULL, 0);
     bench_entry es[2];
     int ne = 0;
     fbm_job job;
 
-    if (rounds < 1 || rounds > MAX_ROUNDS || seconds <= 0 || versions == 0 ||
-        versions > FBM_VR_MAX) {
-        usage();
-        return 2;
-    }
     if (strstr(which, "nonce"))
         es[ne++] = (bench_entry){.layout = FBM_GPU_NONCE, .nr = 1};
     if (strstr(which, "vr"))
         es[ne++] = (bench_entry){.layout = FBM_GPU_VR, .nr = versions};
-    if (!ne) {
-        usage();
-        return 2;
-    }
-    fbm_gpu *g = open_from_args(argc, argv);
-    if (!g)
-        return 2;
+    if (!ne)
+        return -1;
 
     /* A fixed pseudo-random header; t7 = 0 as for any real network target. */
     for (int i = 0; i < 80; i++)
@@ -432,19 +486,153 @@ static int cmd_bench(int argc, char **argv)
     }
     printf("\nwall = scan time on the host clock, including launch gaps and the schedule\n"
            "pre-pass; kernel time = sum of OpenCL profiling intervals.\n");
+    return 0;
+}
+
+static int cmd_bench(int argc, char **argv)
+{
+    const char *which = arg_value(argc, argv, "--kernels", "nonce,vr");
+    int rounds = atoi(arg_value(argc, argv, "--rounds", "10"));
+    double seconds = atof(arg_value(argc, argv, "--seconds", "2"));
+    uint32_t versions = (uint32_t)strtoul(arg_value(argc, argv, "--versions", "65536"), NULL, 0);
+    if (rounds < 1 || rounds > MAX_ROUNDS || seconds <= 0 || versions == 0 ||
+        versions > FBM_VR_MAX) {
+        usage();
+        return 2;
+    }
+    fbm_gpu *g = open_from_args(argc, argv);
+    if (!g)
+        return 2;
+    const int rc = run_bench(g, which, rounds, seconds, versions);
+    fbm_gpu_close(g);
+    if (rc < 0)
+        usage();
+    return rc < 0 ? 2 : 0;
+}
+
+/* ---- sustained runs, power --------------------------------------------- */
+
+/* Board power (W) and shader clock (MHz) of the first AMD GPU, from Linux
+ * hwmon; returns 0 where that is not available (other OSes). */
+static int power_read(double *watts, double *mhz)
+{
+    char path[160];
+    for (int card = 0; card < 8; card++) {
+        unsigned vendor = 0;
+        snprintf(path, sizeof path, "/sys/class/drm/card%d/device/vendor", card);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        int ok = fscanf(f, "%x", &vendor) == 1;
+        fclose(f);
+        if (!ok || vendor != 0x1002)
+            continue;
+        for (int hw = 0; hw < 16; hw++) {
+            static const char *const pw[] = {"power1_average", "power1_input"};
+            double uw = -1, hz = -1;
+            for (int k = 0; k < 2 && uw < 0; k++) {
+                snprintf(path, sizeof path, "/sys/class/drm/card%d/device/hwmon/hwmon%d/%s",
+                         card, hw, pw[k]);
+                if ((f = fopen(path, "r"))) {
+                    if (fscanf(f, "%lf", &uw) != 1)
+                        uw = -1;
+                    fclose(f);
+                }
+            }
+            if (uw < 0)
+                continue;
+            snprintf(path, sizeof path, "/sys/class/drm/card%d/device/hwmon/hwmon%d/freq1_input",
+                     card, hw);
+            if ((f = fopen(path, "r"))) {
+                if (fscanf(f, "%lf", &hz) != 1)
+                    hz = -1;
+                fclose(f);
+            }
+            *watts = uw * 1e-6;
+            *mhz = hz > 0 ? hz * 1e-6 : 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Mines a fixed job for `seconds`, printing the rate (and power) every 10 s.
+ * Returns the average rate in H/s. */
+static double run_sustain(fbm_gpu *g, fbm_gpu_layout layout, double seconds, uint32_t versions)
+{
+    fbm_job job;
+    for (int i = 0; i < 80; i++)
+        job.header[i] = (uint8_t)(i * 29 + 3);
+    job.t7 = 0;
+    const uint32_t nr = layout == FBM_GPU_VR ? versions : 1;
+    double w, mhz;
+    const int have_power = power_read(&w, &mhz);
+    printf("sustained %s run, %.0f s%s\n", layout_name[layout], seconds,
+           have_power ? "" : "; board power is not readable here (Linux hwmon only): read it "
+                             "from Adrenalin's metrics overlay or HWiNFO and note it");
+    printf("| t (s) | MH/s | board W | shader MHz | J/TH |\n|---:|---:|---:|---:|---:|\n");
+    const double t0 = now();
+    double last = t0, win_h = 0, win_w = 0, all_h = 0, all_w = 0;
+    int win_n = 0, all_n = 0;
+    uint32_t n0 = 0;
+    while (now() - t0 < seconds && !stop_requested) {
+        uint64_t nn = (uint64_t)(fbm_gpu_rate(g, layout) * 0.5 / nr);
+        nn = nn < 1 ? 1 : nn > (1ull << 32) - n0 ? (1ull << 32) - n0 : nn;
+        fbm_hit buf[64];
+        fbm_hits hits = {buf, 64, 0};
+        win_h += fbm_gpu_scan(g, layout, &job, 0, nr, n0, nn, &hits);
+        n0 = (uint32_t)(n0 + nn); /* wraps: a new region, same cost */
+        if (have_power && power_read(&w, &mhz)) {
+            win_w += w;
+            win_n++;
+        }
+        const double t = now();
+        if (t - last >= 10 || t - t0 >= seconds) {
+            const double rate = win_h / (t - last);
+            if (win_n) {
+                const double pw = win_w / win_n;
+                printf("| %.0f | %.1f | %.1f | %.0f | %.0f |\n", t - t0, rate / 1e6, pw, mhz,
+                       pw / (rate / 1e12));
+            } else {
+                printf("| %.0f | %.1f | - | - | - |\n", t - t0, rate / 1e6);
+            }
+            fflush(stdout);
+            all_h += win_h;
+            all_w += win_w;
+            all_n += win_n;
+            win_h = win_w = 0;
+            win_n = 0;
+            last = t;
+        }
+    }
+    const double dt = now() - t0, rate = (all_h + win_h) / dt;
+    printf("average %.1f MH/s over %.0f s", rate / 1e6, dt);
+    if (all_n)
+        printf(", %.1f W, %.0f J/TH", all_w / all_n, all_w / all_n / (rate / 1e12));
+    printf("\n");
+    return rate;
+}
+
+static int cmd_sustain(int argc, char **argv)
+{
+    const char *k = arg_value(argc, argv, "--kernel", "vr");
+    const double seconds = atof(arg_value(argc, argv, "--seconds", "300"));
+    const uint32_t versions = (uint32_t)strtoul(arg_value(argc, argv, "--versions", "65536"),
+                                                NULL, 0);
+    if (seconds <= 0 || versions == 0 || versions > FBM_VR_MAX) {
+        usage();
+        return 2;
+    }
+    fbm_gpu *g = open_from_args(argc, argv);
+    if (!g)
+        return 2;
+    signal(SIGINT, on_sigint);
+    run_sustain(g, strcmp(k, "nonce") == 0 ? FBM_GPU_NONCE : FBM_GPU_VR, seconds, versions);
     fbm_gpu_close(g);
     return 0;
 }
 
 /* ---- mine ---------------------------------------------------------------- */
-
-static volatile sig_atomic_t stop_requested;
-
-static void on_sigint(int sig)
-{
-    (void)sig;
-    stop_requested = 1;
-}
 
 static int cmd_mine(int argc, char **argv)
 {
@@ -554,6 +742,88 @@ static int cmd_mine(int argc, char **argv)
     return rc;
 }
 
+/* ---- report ------------------------------------------------------------ */
+
+static int cmd_probe(int argc, char **argv)
+{
+    fbm_gpu *g = open_from_args(argc, argv);
+    if (!g)
+        return 2;
+    const int rc = fbm_gpu_probe(g, stdout);
+    fbm_gpu_close(g);
+    return rc ? 1 : 0;
+}
+
+/* One command for the card's owner: everything this VM could not measure,
+ * in one file to send back. */
+static int cmd_report(int argc, char **argv)
+{
+    const char *path = arg_value(argc, argv, "--out", "fbm-gpu-report.txt");
+    const double sus = atof(arg_value(argc, argv, "--sustain", "300"));
+    const time_t t = time(NULL);
+
+    if (sus < 0) {
+        usage();
+        return 2;
+    }
+    fprintf(stderr, "writing %s; this takes about %.0f minutes. Close games and videos: the GPU "
+            "should be otherwise idle.\n", path, (2 * sus + 150) / 60);
+    if (!freopen(path, "w", stdout)) {
+        perror(path);
+        return 2;
+    }
+    printf("# fbm-gpu report\n\nfbm-gpu %s, %s\n## OpenCL devices\n\n```\n", FBM_VERSION,
+           ctime(&t));
+    fbm_gpu_list();
+    printf("```\n\n## Device and compiled kernels\n\n```\n");
+    fbm_gpu *g = open_from_args(argc, argv);
+    if (!g) {
+        printf("```\nno usable OpenCL device\n");
+        fprintf(stderr, "no usable OpenCL device; see %s\n", path);
+        return 2;
+    }
+    fbm_gpu_info(g, stdout);
+    printf("```\n\n## Correctness tests\n\n```\n");
+    fflush(stdout);
+    fprintf(stderr, "[1/5] correctness tests...\n");
+    const int f = run_tests(g);
+    printf("```\n\n## Issue-rate probe\n\n");
+    fflush(stdout);
+    fprintf(stderr, "[2/5] issue-rate probe...\n");
+    fbm_gpu_probe(g, stdout);
+    printf("\n## Benchmark: nonce vs vr layout\n\n");
+    fflush(stdout);
+    fprintf(stderr, "[3/5] interleaved benchmark...\n");
+    signal(SIGINT, on_sigint);
+    run_bench(g, "nonce,vr", 10, 2, FBM_VR_MAX);
+    printf("\nWith fewer versions per nonce (pools with a narrow BIP 310 mask):\n\n");
+    run_bench(g, "nonce,vr", 5, 1, 64);
+    printf("\n## Sustained runs\n\n");
+    fflush(stdout);
+    if (sus > 0) {
+        fprintf(stderr, "[4/5] sustained runs, %.0f s per layout (Ctrl-C skips)...\n", sus);
+        run_sustain(g, FBM_GPU_VR, sus, FBM_VR_MAX);
+        stop_requested = 0;
+        run_sustain(g, FBM_GPU_NONCE, sus, 1);
+    }
+    printf("\n## Driver-compiled binary\n\n");
+    fprintf(stderr, "[5/5] saving the driver-compiled binary...\n");
+    fbm_gpu_dump(g, "fbm-gpu-kernels.bin");
+    printf("Audit it with `python3 tools/gpu_isacheck.py --binary fbm-gpu-kernels.bin` (needs\n"
+           "llvm-objdump), or send it back with this report.\n\n"
+           "## Power tuning (manual)\n\n"
+           "The power limit moves efficiency more than any kernel change. To measure J/TH at\n"
+           "several limits: set the limit (Adrenalin: Performance > Tuning > Power Limit;\n"
+           "Linux: echo WATTS000000 > /sys/class/drm/cardN/device/hwmon/hwmonM/power1_cap),\n"
+           "then run `fbm-gpu sustain --seconds 300` and note the board power from the\n"
+           "overlay (Windows) or from the output (Linux). If the tests or the mining canary\n"
+           "ever fail after an undervolt, the card is not stable at that setting.\n");
+    fbm_gpu_close(g);
+    fflush(stdout);
+    fprintf(stderr, "done: %s%s\n", path, f ? " (TESTS FAILED: see the report)" : "");
+    return f ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -571,6 +841,12 @@ int main(int argc, char **argv)
         return cmd_bench(argc, argv);
     if (strcmp(cmd, "mine") == 0)
         return cmd_mine(argc, argv);
+    if (strcmp(cmd, "probe") == 0)
+        return cmd_probe(argc, argv);
+    if (strcmp(cmd, "sustain") == 0)
+        return cmd_sustain(argc, argv);
+    if (strcmp(cmd, "report") == 0)
+        return cmd_report(argc, argv);
     if (strcmp(cmd, "info") == 0 || strcmp(cmd, "dump") == 0) {
         fbm_gpu *g = open_from_args(argc, argv);
         int rc = 0;

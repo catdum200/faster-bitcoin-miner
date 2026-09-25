@@ -105,8 +105,13 @@ build/embed: tools/embed.c | build
 build/gpu_sources.h: build/embed $(GPU_CL)
 	build/embed fbm_gpu_src $(GPU_CL) > $@
 
-build/gpu.o: build/gpu_sources.h
+build/gpu_probe_source.h: build/embed gpu/probe.cl
+	build/embed fbm_gpu_probe_src gpu/probe.cl > $@
+
+build/gpu.o: build/gpu_sources.h build/gpu_probe_source.h
 build/gpu.o: INC = -Ibuild
+GIT_VERSION := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
+build/gpu_main.o: INC = -DFBM_VERSION=\"$(GIT_VERSION)\"
 
 # Runs the GPU tests on the first OpenCL device (a CPU OpenCL such as PoCL
 # works too: it checks the kernel source and the host, not GPU speed).

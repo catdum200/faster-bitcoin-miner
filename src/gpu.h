@@ -54,6 +54,9 @@ fbm_gpu_opts *fbm_gpu_options(fbm_gpu *g);
 /* Estimated hash rate of a layout (H/s of kernel time): a model of the device
  * at first, then measured by every scan. Launch sizes follow from it. */
 double fbm_gpu_rate(const fbm_gpu *g, fbm_gpu_layout layout);
+/* Runs the issue-rate probes (gpu/probe.cl) and prints a table. Returns 0,
+ * or -1 if the probe program does not build on this device. */
+int fbm_gpu_probe(fbm_gpu *g, FILE *out);
 /* Device (profiling) time of the kernels of the last scan, in seconds. */
 double fbm_gpu_kernel_seconds(const fbm_gpu *g);
 
