@@ -247,6 +247,36 @@ def row(name, hot, rare, nbytes, res, gen=None):
         '%.2f-%.2f' % (LANES * 2.53 / slots, LANES * 3.13 / slots)))
 
 
+PROBES = {  # kernel: (instruction that must appear 64 times per iteration, extra, count)
+    'probe_add': ('v_add_nc_u32', None, 0), 'probe_alignbit': ('v_alignbit_b32', None, 0),
+    'probe_xor3': ('v_xor3_b32', None, 0), 'probe_add3': ('v_add3_u32', None, 0),
+    'probe_bfi': ('v_bfi_b32', None, 0), 'probe_xad': ('v_xad_u32', None, 0),
+    'probe_mix_salu': ('v_add_nc_u32', 's_xor_b32', 64),
+    'probe_mix_delay': ('v_add_nc_u32', 's_delay_alu', 64),
+}
+
+
+def check_probes(clang, objdump, mcpu):
+    """The issue-rate probes measure what they claim only if each loop
+    iteration is exactly 64 of the probed instruction (plus the mix)."""
+    text = ('#define get_local_id(d) __builtin_amdgcn_workitem_id_x()\n'
+            '#define get_group_id(d) __builtin_amdgcn_workgroup_id_x()\n'
+            '#define get_local_size(d) 64u\n' + open(os.path.join(ROOT, 'gpu/probe.cl')).read())
+    asm, _ = compile_cl(clang, objdump, text, mcpu, [])
+    funcs, ok, bad = parse(asm), True, []
+    for name, (want, extra, n_extra) in PROBES.items():
+        ins = funcs.get(name, [])
+        loop = main_loop(ins) if ins else None
+        ops = collections.Counter(op.split('_e32')[0].split('_e64')[0] for addr, op, size, tgt in ins
+                                  if loop and loop[0] <= addr <= loop[1])
+        valu = sum(n for op, n in ops.items() if op.startswith('v_'))
+        if ops[want] != 64 or valu != 64 or (extra and ops[extra] < n_extra):
+            bad.append('%s (%s x%d, VALU %d)' % (name, want, ops[want], valu))
+    print('\nissue-rate probes: %s' % ('each loop is 64 of its instruction' if not bad
+                                         else 'FAIL: ' + ', '.join(bad)))
+    return not bad
+
+
 def find_kernel(funcs, name):
     # Driver binaries may decorate kernel symbols; match by substring.
     found = [f for f in funcs if f == name] or \
@@ -316,6 +346,9 @@ def main():
             if 'fbm' in fname:
                 print('%s: wave%s, %s VGPRs, scratch %s, ~%s waves/SIMD'
                       % (fname, r['wave'], r['VGPRs'], r['ScratchSize'], r['Occupancy']))
+
+    if not binary:
+        ok &= check_probes(clang, objdump, mcpu)
 
     base_dir = os.path.join(ROOT, 'bench/gpu-baselines/src')
     if not binary and os.path.isdir(base_dir):
