@@ -54,6 +54,16 @@ fbm_gpu_opts *fbm_gpu_options(fbm_gpu *g);
 /* Estimated hash rate of a layout (H/s of kernel time): a model of the device
  * at first, then measured by every scan. Launch sizes follow from it. */
 double fbm_gpu_rate(const fbm_gpu *g, fbm_gpu_layout layout);
+/* Prior-art baseline: cgminer 3.7.2's poclbm kernel (fetched by
+ * bench/gpu-baselines/fetch.sh; not part of fbm). Builds it from `path`;
+ * returns 0, or -1 if the file is missing or does not build. */
+int fbm_gpu_load_baseline(fbm_gpu *g, const char *path);
+/* Scans with the baseline. Unlike fbm_gpu_scan, its nonce loop runs over the
+ * big-endian message word W3 = bswap(nonce), so the range [w3_0, w3_0 + nn)
+ * is in W3 space; hits are reported as real nonces. It supports only real
+ * network targets (t7 = 0) and at most 15 hits per scan (its own design). */
+uint64_t fbm_gpu_scan_baseline(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t nr,
+                               uint32_t w3_0, uint64_t nn, fbm_hits *out);
 /* Runs the issue-rate probes (gpu/probe.cl) and prints a table. Returns 0,
  * or -1 if the probe program does not build on this device. */
 int fbm_gpu_probe(fbm_gpu *g, FILE *out);

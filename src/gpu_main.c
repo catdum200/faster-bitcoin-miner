@@ -13,12 +13,16 @@
 #include "kernels.h"
 #include "sha256.h"
 #include "stats.h"
+#include "util.h"
 
 #ifndef FBM_VERSION
 #define FBM_VERSION "unknown"
 #endif
 
-static const char *const layout_name[] = {"nonce", "vr"};
+/* Layouts 0 and 1 are fbm_gpu_layout; 2 is the optional cgminer baseline. */
+enum { POCLBM = 2 };
+static const char *const layout_name[] = {"nonce", "vr", "poclbm"};
+static int have_baseline;
 
 static void usage(void)
 {
@@ -28,7 +32,7 @@ static void usage(void)
             "  fbm-gpu info                      device and compiled-kernel resources\n"
             "  fbm-gpu test                      correctness tests against the CPU reference\n"
             "  fbm-gpu bench [options]           interleaved hash-rate benchmark\n"
-            "      --kernels nonce,vr (default both)  --rounds R (default 10)\n"
+            "      --kernels nonce,vr,poclbm (default all available)  --rounds R (default 10)\n"
             "      --seconds S per run (default 2)     --versions N for vr (default 65536)\n"
             "  fbm-gpu mine --header HEX80 [options] search for valid (version, nonce) pairs\n"
             "      --start NONCE --count N (default: whole 2^32 range)\n"
@@ -47,7 +51,10 @@ static void usage(void)
             "  --nonce-iters N --vr-iters N      nonces per work-item per launch (16, 64)\n"
             "  --launch-ms MS                    target kernel launch length (default 8, which\n"
             "                                    keeps a desktop on the same GPU responsive)\n"
-            "  --dedicated                       100 ms launches, for a GPU with no display\n");
+            "  --dedicated                       100 ms launches, for a GPU with no display\n"
+            "  --baseline FILE                   cgminer's poclbm kernel, run as the prior-art\n"
+            "                                    baseline (default: bench/gpu-baselines/src/\n"
+            "                                    poclbm130302.cl, from fetch.sh, if present)\n");
 }
 
 static const char *arg_value(int argc, char **argv, const char *name, const char *def)
@@ -92,8 +99,15 @@ static fbm_gpu *open_from_args(int argc, char **argv)
         return NULL;
     }
     fbm_gpu *g = fbm_gpu_open(&o);
-    if (g)
-        printf("device: %s\n", fbm_gpu_name(g));
+    if (!g)
+        return NULL;
+    printf("device: %s\n", fbm_gpu_name(g));
+    /* The prior-art baseline, if fetched (bench/gpu-baselines/fetch.sh). */
+    const char *bpath = arg_value(argc, argv, "--baseline",
+                                  "bench/gpu-baselines/src/poclbm130302.cl");
+    have_baseline = fbm_gpu_load_baseline(g, bpath) == 0;
+    if (!have_baseline && has_flag(argc, argv, "--baseline"))
+        fprintf(stderr, "warning: baseline %s missing or does not build\n", bpath);
     return g;
 }
 
@@ -351,6 +365,35 @@ static void test_planted(fbm_gpu *g)
     }
 }
 
+/* The ported baseline must find the real nonce of every known block (with
+ * its true version: it cannot roll) and report nothing false. */
+static void test_baseline(fbm_gpu *g)
+{
+    printf("baseline poclbm rediscovers the real nonce of %zu mainnet blocks\n",
+           fbm_known_block_count);
+    for (size_t b = 0; b < fbm_known_block_count; b++) {
+        fbm_job job;
+        uint8_t target[32], hash[32];
+        fbm_hex_decode(fbm_known_blocks[b].hex, job.header, 80);
+        fbm_bits_to_target(fbm_header_get(job.header, FBM_OFF_BITS), target);
+        job.t7 = fbm_top32_le(target);
+        const uint32_t nonce = fbm_header_get(job.header, FBM_OFF_NONCE);
+        fbm_hits h = new_hits(64);
+        fbm_gpu_scan_baseline(g, &job, 0, 1, fbm_bswap32(nonce) - 3000, 5000, &h);
+        int found = 0;
+        for (size_t j = 0; j < h.n && j < h.cap; j++) {
+            uint8_t hdr[80];
+            memcpy(hdr, job.header, 80);
+            fbm_header_set(hdr, FBM_OFF_NONCE, h.v[j].nonce);
+            fbm_sha256d(hdr, 80, hash);
+            CHECK(fbm_top32_le(hash) <= job.t7, "%s/poclbm: bogus candidate", fbm_known_blocks[b].name);
+            found |= h.v[j].nonce == nonce;
+        }
+        CHECK(found, "%s/poclbm: missed nonce %u", fbm_known_blocks[b].name, nonce);
+        free(h.v);
+    }
+}
+
 /* Every test; returns the number of failures. */
 static int run_tests(fbm_gpu *g)
 {
@@ -369,6 +412,10 @@ static int run_tests(fbm_gpu *g)
     test_planted(g);
     test_overflow(g);
     test_canary(g);
+    if (have_baseline)
+        test_baseline(g);
+    else
+        printf("(baseline poclbm not loaded: run bench/gpu-baselines/fetch.sh to include it)\n");
     printf(failures ? "%d FAILURE(S)\n" : "all GPU tests passed\n", failures);
     return failures;
 }
@@ -396,7 +443,7 @@ static void on_sigint(int sig)
 #define MAX_ROUNDS 200
 
 typedef struct {
-    fbm_gpu_layout layout;
+    int layout; /* fbm_gpu_layout, or POCLBM */
     uint32_t nr;
     uint64_t nn;
     double rate[MAX_ROUNDS];  /* wall clock, MH/s */
@@ -408,7 +455,9 @@ static double bench_once(fbm_gpu *g, bench_entry *e, const fbm_job *job, double 
     fbm_hit buf[64];
     fbm_hits hits = {buf, 64, 0};
     const double t0 = now();
-    uint64_t n = fbm_gpu_scan(g, e->layout, job, 0, e->nr, 0, e->nn, &hits);
+    uint64_t n = e->layout == POCLBM ? fbm_gpu_scan_baseline(g, job, 0, 1, 0, e->nn, &hits)
+                                     : fbm_gpu_scan(g, (fbm_gpu_layout)e->layout, job, 0, e->nr,
+                                                    0, e->nn, &hits);
     const double dt = now() - t0;
     *krate = n / fbm_gpu_kernel_seconds(g) / 1e6;
     return n / dt / 1e6;
@@ -419,16 +468,21 @@ static double bench_once(fbm_gpu *g, bench_entry *e, const fbm_job *job, double 
  * bootstrap 95% CI. */
 static int run_bench(fbm_gpu *g, const char *which, int rounds, double seconds, uint32_t versions)
 {
-    bench_entry es[2];
+    bench_entry es[3];
     int ne = 0;
     fbm_job job;
 
+    if (strstr(which, "poclbm") && have_baseline)
+        es[ne++] = (bench_entry){.layout = POCLBM, .nr = 1};
     if (strstr(which, "nonce"))
         es[ne++] = (bench_entry){.layout = FBM_GPU_NONCE, .nr = 1};
     if (strstr(which, "vr"))
         es[ne++] = (bench_entry){.layout = FBM_GPU_VR, .nr = versions};
     if (!ne)
         return -1;
+    /* Speedups are against the prior-art kernel if it runs, else the
+     * nonce layout. */
+    const int base = 0;
 
     /* A fixed pseudo-random header; t7 = 0 as for any real network target. */
     for (int i = 0; i < 80; i++)
@@ -462,27 +516,20 @@ static int run_bench(fbm_gpu *g, const char *which, int rounds, double seconds, 
     }
     fprintf(stderr, "\r                \r");
 
-    printf("| kernel | MH/s median (wall) | IQR | min..max | MH/s (kernel time) |%s\n",
-           ne == 2 ? " vr / nonce [95% CI] |" : "");
-    printf("|---|---:|---:|---:|---:|%s\n", ne == 2 ? "---:|" : "");
+    printf("| kernel | MH/s median (wall) | IQR | min..max | MH/s (kernel time) | vs %s [95%% CI] |\n"
+           "|---|---:|---:|---:|---:|---:|\n", layout_name[es[base].layout]);
     for (int i = 0; i < ne; i++) {
-        double s[MAX_ROUNDS];
+        double s[MAX_ROUNDS], ratio[MAX_ROUNDS], lo, hi;
         memcpy(s, es[i].rate, sizeof(double) * rounds);
         qsort(s, rounds, sizeof(double), fbm_cmp_double);
-        printf("| %s | %.1f | %.1f..%.1f | %.1f..%.1f | %.1f |", layout_name[es[i].layout],
+        for (int r = 0; r < rounds; r++)
+            ratio[r] = es[i].rate[r] / es[base].rate[r];
+        fbm_bootstrap_ci(ratio, rounds, &lo, &hi);
+        printf("| %s%s | %.1f | %.1f..%.1f | %.1f..%.1f | %.1f | %.3fx [%.3f, %.3f] |\n",
+               layout_name[es[i].layout], es[i].layout == POCLBM ? " (cgminer 3.7.2)" : "",
                fbm_quantile(s, rounds, 0.5), fbm_quantile(s, rounds, 0.25),
                fbm_quantile(s, rounds, 0.75), s[0], s[rounds - 1],
-               fbm_median(es[i].krate, rounds));
-        if (ne == 2 && es[i].layout == FBM_GPU_VR) {
-            double ratio[MAX_ROUNDS], lo, hi;
-            for (int r = 0; r < rounds; r++)
-                ratio[r] = es[i].rate[r] / es[1 - i].rate[r];
-            fbm_bootstrap_ci(ratio, rounds, &lo, &hi);
-            printf(" %.3fx [%.3f, %.3f] |", fbm_median(ratio, rounds), lo, hi);
-        } else if (ne == 2) {
-            printf(" |");
-        }
-        printf("\n");
+               fbm_median(es[i].krate, rounds), fbm_median(ratio, rounds), lo, hi);
     }
     printf("\nwall = scan time on the host clock, including launch gaps and the schedule\n"
            "pre-pass; kernel time = sum of OpenCL profiling intervals.\n");
@@ -491,7 +538,7 @@ static int run_bench(fbm_gpu *g, const char *which, int rounds, double seconds, 
 
 static int cmd_bench(int argc, char **argv)
 {
-    const char *which = arg_value(argc, argv, "--kernels", "nonce,vr");
+    const char *which = arg_value(argc, argv, "--kernels", "poclbm,nonce,vr");
     int rounds = atoi(arg_value(argc, argv, "--rounds", "10"));
     double seconds = atof(arg_value(argc, argv, "--seconds", "2"));
     uint32_t versions = (uint32_t)strtoul(arg_value(argc, argv, "--versions", "65536"), NULL, 0);
@@ -795,9 +842,9 @@ static int cmd_report(int argc, char **argv)
     fflush(stdout);
     fprintf(stderr, "[3/5] interleaved benchmark...\n");
     signal(SIGINT, on_sigint);
-    run_bench(g, "nonce,vr", 10, 2, FBM_VR_MAX);
+    run_bench(g, "poclbm,nonce,vr", 10, 2, FBM_VR_MAX);
     printf("\nWith fewer versions per nonce (pools with a narrow BIP 310 mask):\n\n");
-    run_bench(g, "nonce,vr", 5, 1, 64);
+    run_bench(g, "poclbm,nonce,vr", 5, 1, 64);
     printf("\n## Sustained runs\n\n");
     fflush(stdout);
     if (sus > 0) {

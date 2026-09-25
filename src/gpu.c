@@ -41,6 +41,9 @@ struct fbm_gpu {
     cl_command_queue q;
     cl_program prog;
     cl_kernel k_nonce, k_sched, k_vr;
+    cl_program base_prog; /* optional poclbm baseline */
+    cl_kernel k_base;
+    cl_mem base_out;
     cl_mem job, hits, lanes, sched;
     size_t lanes_words;
     uint32_t hit_alloc; /* pairs allocated; o.hit_cap may be lowered at run time */
@@ -218,6 +221,12 @@ void fbm_gpu_close(fbm_gpu *g)
 {
     if (!g)
         return;
+    if (g->k_base)
+        clReleaseKernel(g->k_base);
+    if (g->base_prog)
+        clReleaseProgram(g->base_prog);
+    if (g->base_out)
+        clReleaseMemObject(g->base_out);
     if (g->lanes)
         clReleaseMemObject(g->lanes);
     if (g->sched)
@@ -377,8 +386,7 @@ static void reset_hits(fbm_gpu *g)
 /* Waits for the queue, sums kernel time, and reads the hit list. Each hit is
  * (index, nonce); map(index) gives the version to report. Scans of at least
  * `hashes` update the layout's rate estimate. */
-static void collect(fbm_gpu *g, fbm_gpu_layout layout, double hashes, fbm_hits *out,
-                    uint32_t base, uint32_t r_off)
+static void collect_time(fbm_gpu *g, fbm_gpu_layout layout, double hashes)
 {
     CL_OK(clFinish(g->q));
     g->ksec = 0;
@@ -396,6 +404,12 @@ static void collect(fbm_gpu *g, fbm_gpu_layout layout, double hashes, fbm_hits *
         g->rate[layout] = g->measured[layout] ? 0.5 * g->rate[layout] + 0.5 * r : r;
         g->measured[layout] = 1;
     }
+}
+
+static void collect(fbm_gpu *g, fbm_gpu_layout layout, double hashes, fbm_hits *out,
+                    uint32_t base, uint32_t r_off)
+{
+    collect_time(g, layout, hashes);
 
     uint32_t *h = g->host_hits;
     CL_OK(clEnqueueReadBuffer(g->q, g->hits, CL_TRUE, 0, 8, h, 0, NULL, NULL));
@@ -515,6 +529,125 @@ static uint64_t scan_vr(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t nr
         launch(g, g->k_vr, 2, global, local);
     }
     collect(g, FBM_GPU_VR, (double)nrp * nn, out, base, r0);
+    return (uint64_t)nr * nn;
+}
+
+/* ---- prior-art baseline: cgminer 3.7.2 poclbm --------------------------- */
+
+int fbm_gpu_load_baseline(fbm_gpu *g, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *src = malloc((size_t)n + 1);
+    const size_t got = fread(src, 1, (size_t)n, f);
+    fclose(f);
+    src[got] = '\0';
+    cl_int err;
+    const char *srcs[1] = {src};
+    g->base_prog = clCreateProgramWithSource(g->ctx, 1, srcs, NULL, &err);
+    free(src);
+    CL_OK(err);
+    /* As cgminer builds it for GCN: amd_bitalign where the driver has AMD's
+     * media ops, no BFI_INT binary patching, one nonce per work-item. */
+    char ext[4096] = "", opts[256];
+    clGetDeviceInfo(g->dev, CL_DEVICE_EXTENSIONS, sizeof ext, ext, NULL);
+    snprintf(opts, sizeof opts, "-DWORKSIZE=%u%s", g->o.wg,
+             strstr(ext, "cl_amd_media_ops") ? " -DBITALIGN" : "");
+    if (clBuildProgram(g->base_prog, 1, &g->dev, opts, NULL, NULL) != CL_SUCCESS) {
+        clReleaseProgram(g->base_prog);
+        g->base_prog = NULL;
+        return -1;
+    }
+    g->k_base = clCreateKernel(g->base_prog, "search", &err);
+    CL_OK(err);
+    g->base_out = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, 16 * 4, NULL, &err);
+    CL_OK(err);
+    return 0;
+}
+
+/* The kernel's 26 per-job arguments (all but the nonce base and the output
+ * buffer), derived clean-room from how the kernel consumes them, not from
+ * cgminer's host code. With (A..H) the state after rounds 0-2 of block 2 and
+ * T = H + S1(E) + Ch(E,F,G) + K3, round 3 gives e = D + T + W3 and
+ * a = T + S0(A) + Maj(A,B,C) + W3; the rest are round-4..6 partial sums and
+ * the constant parts of schedule words W16..W19, W23, W24 and W31..W33. */
+static void poclbm_args(const uint32_t in[11], uint32_t a[26])
+{
+    const uint32_t *K = fbm_sha256_k;
+    uint32_t s[8];
+    memcpy(s, in, sizeof s);
+    for (int t = 0; t < 3; t++) {
+        const uint32_t t1 = s[7] + S_BSIG1(s[4]) + S_CH(s[4], s[5], s[6]) + K[t] + in[8 + t];
+        const uint32_t t2 = S_BSIG0(s[0]) + S_MAJ(s[0], s[1], s[2]);
+        memmove(s + 1, s, 7 * sizeof s[0]);
+        s[4] += t1;
+        s[0] = t1 + t2;
+    }
+    const uint32_t A = s[0], B = s[1], C = s[2], D = s[3], E = s[4], F = s[5], G = s[6], H = s[7];
+    const uint32_t W0 = in[8], W1 = in[9], W2 = in[10];
+    const uint32_t W16 = S_SSIG0(W1) + W0, W17 = S_SSIG1(0x280u) + S_SSIG0(W2) + W1;
+    const uint32_t T = H + S_BSIG1(E) + S_CH(E, F, G) + K[3];
+    memcpy(a, in, 8 * sizeof a[0]); /* state0..7: the midstate */
+    a[8] = E;                         /* b1 */
+    a[9] = F;                         /* c1 */
+    a[10] = A;                        /* f1 */
+    a[11] = B;                        /* g1 */
+    a[12] = C;                        /* h1 */
+    a[13] = W16;                      /* fw0 */
+    a[14] = W17;                      /* fw1 */
+    a[15] = S_SSIG1(W16) + W2;        /* fw2 */
+    a[16] = S_SSIG1(W17) + S_SSIG0(0x80000000u); /* fw3 */
+    a[17] = S_SSIG0(W16) + 0x280u;    /* fw15 */
+    a[18] = S_SSIG0(W17) + W16;       /* fw01r */
+    a[19] = G + K[4] + 0x80000000u;   /* D1A */
+    a[20] = F + K[5];                 /* C1addK5 */
+    a[21] = E + K[6];                 /* B1addK6 */
+    a[22] = W16 + K[16];              /* W16addK16 */
+    a[23] = W17 + K[17];              /* W17addK17 */
+    a[24] = T + S_BSIG0(A) + S_MAJ(A, B, C); /* PreVal4addT1 */
+    a[25] = T + D;                    /* Preval0 */
+}
+
+uint64_t fbm_gpu_scan_baseline(fbm_gpu *g, const fbm_job *job, uint32_t r0, uint32_t nr,
+                               uint32_t w3_0, uint64_t nn, fbm_hits *out)
+{
+    const uint32_t base = fbm_header_get(job->header, FBM_OFF_VERSION), wg = g->o.wg;
+    uint64_t per_launch = (uint64_t)(launch_size(g, FBM_GPU_NONCE) / wg) * wg;
+    per_launch = per_launch < wg ? wg : per_launch > (1ull << 31) ? 1ull << 31 : per_launch;
+    for (uint32_t r = r0; r < r0 + nr; r++) {
+        const uint32_t version = fbm_rolled_version(base, r);
+        uint32_t in[11], a[26], zero[16] = {0};
+        fbm_job_inputs(job->header, version, in);
+        poclbm_args(in, a);
+        CL_OK(clEnqueueWriteBuffer(g->q, g->base_out, CL_TRUE, 0, sizeof zero, zero, 0, NULL,
+                                   NULL));
+        for (cl_uint i = 0; i < 13; i++)
+            set_u32(g->k_base, i, a[i]);
+        for (cl_uint i = 13; i < 26; i++)
+            set_u32(g->k_base, i + 1, a[i]); /* argument 13 is the nonce base */
+        set_mem(g->k_base, 27, g->base_out);
+        for (uint64_t off = 0; off < nn; off += per_launch) {
+            const uint64_t cnt = nn - off < per_launch ? nn - off : per_launch;
+            const size_t global = (size_t)((cnt + wg - 1) / wg) * wg, local = wg;
+            set_u32(g->k_base, 13, (uint32_t)(w3_0 + off));
+            launch(g, g->k_base, 1, &global, &local);
+        }
+        uint32_t o[16];
+        CL_OK(clEnqueueReadBuffer(g->q, g->base_out, CL_TRUE, 0, sizeof o, o, 0, NULL, NULL));
+        const uint32_t n = o[15] < 15 ? o[15] : 15;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t w3 = o[i];
+            if ((uint32_t)(w3 - w3_0) < nn) /* the last work-group runs past the range */
+                fbm_hits_push(out, version, fbm_bswap32(w3));
+        }
+        if (o[15] > 15)
+            out->n += o[15] - 15; /* its buffer holds 15; the rest are lost */
+    }
+    collect_time(g, FBM_GPU_NONCE, (double)nr * nn);
     return (uint64_t)nr * nn;
 }
 
