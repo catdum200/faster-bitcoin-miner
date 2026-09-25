@@ -7,3 +7,5 @@ bench/cpuminer-opt/src/
 bench/gpu-baselines/src/
 fbm-gpu
 /fbm-gpu.exe
+fbm-gpu-report.txt
+fbm-gpu-kernels.bin
