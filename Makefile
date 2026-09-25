@@ -21,6 +21,14 @@ build/kernel_avx512.o build/kernel_avx512vl.o: ISA = -mavx512f -mavx512bw -mavx5
 # Optional prior-art baseline kernels: `make BASELINES=1` fetches cpuminer-opt
 # (GPL-2) at a pinned release and links its sha256d kernels into fbm, built
 # the way its own build.sh does (-O3 -march=native).
+# make does not track flags: rebuild the kernel registry when BASELINES is
+# toggled, or it links stale entries (missing kernels or undefined symbols).
+BASELINES_STAMP = build/.baselines-$(if $(BASELINES),on,off)
+$(BASELINES_STAMP): | build
+	rm -f build/.baselines-*
+	touch $@
+build/kernels.o: $(BASELINES_STAMP)
+
 ifdef BASELINES
 CMO = bench/cpuminer-opt/src
 OBJ += build/kernel_cpuminer_opt.o build/cmo_sha256_4way.o build/cmo_simd_constants.o
