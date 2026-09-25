@@ -8,6 +8,8 @@ SCAN_DECL(fbm_scan_ref);
 SCAN_DECL(fbm_scan_openssl);
 SCAN_DECL(fbm_scan_scalar);
 SCAN_DECL(fbm_scan_scalar_vr);
+SCAN_DECL(fbm_scan_rdna_emu);
+SCAN_DECL(fbm_scan_rdna_emu_vr);
 SCAN_DECL(fbm_scan_avx2);
 SCAN_DECL(fbm_scan_avx2_vr);
 SCAN_DECL(fbm_scan_avx512vl);
@@ -55,6 +57,11 @@ static const fbm_kernel kernels[] = {
      cpu_any, 1, 0, FBM_ISA_SCALAR},
     {"scalar-vr", "scalar + version rolling: one block-2 schedule per nonce for all versions",
      fbm_scan_scalar_vr, cpu_any, 1, 1, FBM_ISA_SCALAR},
+    /* The GPU's generated code on the CPU, for the tests; never chosen as "best". */
+    {"rdna-emu", "check: GPU (RDNA) nonce-lane kernel code, one lane at a time on the CPU",
+     fbm_scan_rdna_emu, cpu_any, 1, 0, FBM_ISA_SCALAR},
+    {"rdna-emu-vr", "check: GPU (RDNA) version-lane kernel code, one lane at a time on the CPU",
+     fbm_scan_rdna_emu_vr, cpu_any, 1, 1, FBM_ISA_SCALAR},
     {"avx2", "8 nonces per AVX2 vector", fbm_scan_avx2, cpu_avx2, 1, 0, FBM_ISA_YMM},
     {"avx2-vr", "8 versions per AVX2 vector, schedule shared in scalar", fbm_scan_avx2_vr,
      cpu_avx2, 8, 1, FBM_ISA_YMM},
@@ -91,7 +98,8 @@ const fbm_kernel *fbm_kernel_best(uint32_t versions)
     const int want_vr = versions >= 64;
     for (size_t i = fbm_kernel_count(); i-- > 0;) {
         if (kernels[i].supported() && kernels[i].vr == want_vr &&
-            strncmp(kernels[i].desc, "baseline:", 9) != 0)
+            strncmp(kernels[i].desc, "baseline:", 9) != 0 &&
+            strncmp(kernels[i].desc, "check:", 6) != 0)
             return &kernels[i];
     }
     return &kernels[0];

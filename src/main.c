@@ -10,6 +10,7 @@
 #include "miner.h"
 #include "selftest.h"
 #include "sha256.h"
+#include "stats.h"
 
 static void usage(void)
 {
@@ -48,51 +49,6 @@ static int cmd_list(void)
     printf("fastest supported: %s (1 version per nonce), %s (64+ rolled versions)\n",
            fbm_kernel_best(1)->name, fbm_kernel_best(FBM_VR_MAX)->name);
     return 0;
-}
-
-static int cmp_double(const void *a, const void *b)
-{
-    double x = *(const double *)a, y = *(const double *)b;
-    return x < y ? -1 : x > y;
-}
-
-/* Quantile of a sorted array, linear interpolation. */
-static double quantile(const double *sorted, int n, double q)
-{
-    double pos = q * (n - 1);
-    int i = (int)pos;
-    if (i >= n - 1)
-        return sorted[n - 1];
-    return sorted[i] + (pos - i) * (sorted[i + 1] - sorted[i]);
-}
-
-static double median(const double *v, int n)
-{
-    double tmp[256];
-    memcpy(tmp, v, sizeof(double) * n);
-    qsort(tmp, n, sizeof(double), cmp_double);
-    return quantile(tmp, n, 0.5);
-}
-
-/* Percentile bootstrap 95% CI of the median of v (resampling runs). */
-static void bootstrap_ci(const double *v, int n, double *lo, double *hi)
-{
-    enum { B = 2000 };
-    static double meds[B];
-    double tmp[256];
-    uint64_t s = 0x9e3779b97f4a7c15ull;
-    for (int b = 0; b < B; b++) {
-        for (int i = 0; i < n; i++) {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            tmp[i] = v[s % (uint64_t)n];
-        }
-        meds[b] = median(tmp, n);
-    }
-    qsort(meds, B, sizeof(double), cmp_double);
-    *lo = quantile(meds, B, 0.025);
-    *hi = quantile(meds, B, 0.975);
 }
 
 static int cmd_freq(void)
@@ -244,21 +200,21 @@ static int cmd_bench(int argc, char **argv)
     for (int i = 0; i < ne; i++) {
         double sorted[MAX_ROUNDS];
         memcpy(sorted, es[i].rate, sizeof(double) * rounds);
-        qsort(sorted, rounds, sizeof(double), cmp_double);
-        double med = quantile(sorted, rounds, 0.5);
+        qsort(sorted, rounds, sizeof(double), fbm_cmp_double);
+        double med = fbm_quantile(sorted, rounds, 0.5);
         double ns = threads * 1e3 / med; /* ns per hash per core */
         int low = 0;
         for (int r = 0; r < rounds; r++)
             low += es[i].rate[r] < 0.8 * med;
         printf("| %s | %.3f | %.3f..%.3f | %.3f..%.3f | %.2f | %.0f |", es[i].label, med,
-               quantile(sorted, rounds, 0.25), quantile(sorted, rounds, 0.75), sorted[0],
+               fbm_quantile(sorted, rounds, 0.25), fbm_quantile(sorted, rounds, 0.75), sorted[0],
                sorted[rounds - 1], ns, ns * ghz[es[i].k->isa]);
         if (base >= 0) {
             double ratio[MAX_ROUNDS], lo, hi;
             for (int r = 0; r < rounds; r++)
                 ratio[r] = es[i].rate[r] / es[base].rate[r];
-            bootstrap_ci(ratio, rounds, &lo, &hi);
-            printf(" %.3fx [%.3f, %.3f] |", median(ratio, rounds), lo, hi);
+            fbm_bootstrap_ci(ratio, rounds, &lo, &hi);
+            printf(" %.3fx [%.3f, %.3f] |", fbm_median(ratio, rounds), lo, hi);
         }
         if (low)
             printf(" (%d run(s) < 80%% of median)", low);

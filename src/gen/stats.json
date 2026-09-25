@@ -214,5 +214,83 @@
   },
   "target": "avx512",
   "vector_instructions": 2387
+ },
+ {
+  "mode": "nonce",
+  "nonce_scalar_ops": 0,
+  "ops": {
+   "job": {
+    "add": 54,
+    "bfi": 4,
+    "bsig0": 4,
+    "bsig1": 4,
+    "ch": 4,
+    "ssig0": 4,
+    "ssig1": 2,
+    "xor": 5
+   },
+   "lane": {},
+   "nonce": {},
+   "var": {
+    "add": 231,
+    "add3": 406,
+    "bfi": 116,
+    "bsig0": 116,
+    "bsig1": 120,
+    "ch": 120,
+    "ssig0": 69,
+    "ssig1": 87,
+    "xor": 114
+   }
+  },
+  "slots": {
+   "job": 27,
+   "lane": 0,
+   "nonce": 0
+  },
+  "target": "rdna",
+  "vector_instructions": 2555
+ },
+ {
+  "mode": "vr",
+  "nonce_scalar_ops": 235,
+  "ops": {
+   "job": {
+    "add": 6,
+    "ssig0": 4,
+    "ssig1": 2
+   },
+   "lane": {
+    "add": 45,
+    "bfi": 4,
+    "bsig0": 4,
+    "bsig1": 4,
+    "ch": 4,
+    "xor": 5
+   },
+   "nonce": {
+    "add": 159,
+    "ssig0": 32,
+    "ssig1": 44
+   },
+   "var": {
+    "add": 235,
+    "add3": 326,
+    "bfi": 116,
+    "bsig0": 116,
+    "bsig1": 120,
+    "ch": 120,
+    "ssig0": 37,
+    "ssig1": 43,
+    "xor": 114
+   }
+  },
+  "slots": {
+   "job": 11,
+   "lane": 19,
+   "nonce": 47
+  },
+  "target": "rdna",
+  "vector_instructions": 2175
  }
 ]

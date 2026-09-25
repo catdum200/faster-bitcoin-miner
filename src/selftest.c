@@ -9,6 +9,7 @@
 
 #include <openssl/sha.h>
 
+#include "blocks.h"
 #include "header.h"
 #include "kernels.h"
 #include "miner.h"
@@ -27,15 +28,8 @@ static int failures;
         }                                                 \
     } while (0)
 
-/* Real mainnet headers: genesis (height 0) and height 125552. */
-const char *const fbm_genesis_hex =
-    "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27a"
-    "c72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
 static const char *const genesis_hash =
     "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
-const char *const fbm_block125552_hex =
-    "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000e320b6c2fffc8d75"
-    "0423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5d74df2b9441a42a14695";
 static const char *const block125552_hash =
     "00000000000000001e8d6829a8a21adc5d38d0a473b144b6765798e61f98bd1d";
 
@@ -184,50 +178,21 @@ static void test_kernels_differential(void)
     diff_case("production t7=0", &job, 0, 16, 0, 1 << 14);
 }
 
-/* Mainnet blocks whose versions have BIP 320 bits rolled by the ASIC that
- * mined them: heights 800000-910000 and three from September 2026 (ViaBTC,
- * Braiins Pool, MARA Pool). Hashes were checked against mempool.space. */
-static const char *const recent_blocks[][2] = {
-    {"800000", "00601d3455bb9fbd966b3ea2dc42d0c22722e4c0c1729fad172101000000000000000000550"
-               "87fab0c8f3f89f8bcfd4df26c504d81b0a88e04907161838c0c53001af09135edbd64943805175e955e06"},
-    {"850000", "0080bb2b13b3152752d9cf2a36fcd16d78f64269d847932f076b02000000000000000000d51"
-               "a6bd669cf6bc30269a259c2918e6319269fc15f020a82ddd6a5fdc1f5cf71ca618066255d03176ab0fb7c"},
-    {"900000", "00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f"
-               "96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92"},
-    {"910000", "00a0572be06d4f01a2ed2228dec965539cc8b96512ccde7d2824010000000000000000006f2"
-               "8c30dc748f6b1430fb2b9a5a94b5b34a5df6e318c6cc5c310a1a35b432b59a3ab9d68b32c021719d103e9"},
-    {"968566", "0000003874fd1f0f0ea2296a90502e569622d8e3bc1f8d201d650000000000000000000001c20b8594f8"
-               "5b5e3d92e4a66ac4f2864913fcd8b44c4a3bbf7da256378081ec2fa1b66ac51e02177b22a039"},
-    {"968562", "0060aa297152dfd5bda8f97830a47df977bf41a6254159cc0366000000000000000000008abded7270cd"
-               "1dfde5a3cfd286b8a1787980c006b9f35b8f47146dc68abdbac0ef95b66ac51e021718227e7a"},
-    {"968555", "00607925ad9b791fcca5e6d220cd922225cc79e7811a78d775110000000000000000000033382e41f38a"
-               "d364b21b717a3baa7cdf34e834c52bbcd3f800d785aeac3539ff6a7eb66ac51e021748202491"},
-};
-
 /* Each kernel must rediscover the real (version, nonce) of real blocks. The
  * job's base version is the real one XOR (5 << 13), so the solution sits at
  * rolled-version index r = 5 of the 16 scanned: this checks the BIP 320
  * version mapping as well as the hashing. */
 static void test_kernels_known(void)
 {
-    const char *names[16], *hexes[16];
-    size_t nblocks = 0;
-    names[nblocks] = "genesis";
-    hexes[nblocks++] = fbm_genesis_hex;
-    names[nblocks] = "125552";
-    hexes[nblocks++] = fbm_block125552_hex;
-    for (size_t i = 0; i < sizeof recent_blocks / sizeof recent_blocks[0]; i++) {
-        names[nblocks] = recent_blocks[i][0];
-        hexes[nblocks++] = recent_blocks[i][1];
-    }
+    const size_t nblocks = fbm_known_block_count;
     printf("kernels rediscover real (version, nonce) of %zu mainnet blocks\n", nblocks);
     for (size_t b = 0; b < nblocks; b++) {
         fbm_job job;
         uint8_t target[32], hash[32];
-        fbm_hex_decode(hexes[b], job.header, 80);
+        fbm_hex_decode(fbm_known_blocks[b].hex, job.header, 80);
         fbm_sha256d(job.header, 80, hash);
         fbm_bits_to_target(fbm_header_get(job.header, FBM_OFF_BITS), target);
-        CHECK(fbm_cmp256_le(hash, target) <= 0, "%s: header does not meet its target", names[b]);
+        CHECK(fbm_cmp256_le(hash, target) <= 0, "%s: header does not meet its target", fbm_known_blocks[b].name);
         job.t7 = fbm_top32_le(target);
         const uint32_t nonce = fbm_header_get(job.header, FBM_OFF_NONCE);
         const uint32_t version = fbm_header_get(job.header, FBM_OFF_VERSION);
@@ -244,11 +209,11 @@ static void test_kernels_known(void)
                 fbm_header_set(hdr, FBM_OFF_VERSION, h.v[j].version);
                 fbm_header_set(hdr, FBM_OFF_NONCE, h.v[j].nonce);
                 fbm_sha256d(hdr, 80, hash);
-                CHECK(fbm_top32_le(hash) <= job.t7, "%s/%s: bogus candidate", names[b], k->name);
+                CHECK(fbm_top32_le(hash) <= job.t7, "%s/%s: bogus candidate", fbm_known_blocks[b].name, k->name);
                 if (h.v[j].nonce == nonce && h.v[j].version == version)
                     found = 1;
             }
-            CHECK(found, "%s: kernel %s missed version 0x%08x nonce %u", names[b], k->name, version,
+            CHECK(found, "%s: kernel %s missed version 0x%08x nonce %u", fbm_known_blocks[b].name, k->name, version,
                   nonce);
             free(h.v);
         }

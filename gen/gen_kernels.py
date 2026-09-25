@@ -59,8 +59,10 @@ FUNCS = {
     'ssig1': lambda x: rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10),
     'ch': lambda e, f, g: (e & f) ^ (~e & g & MASK),
     'maj': lambda a, b, c: (a & b) ^ (a & c) ^ (b & c),
+    'add3': lambda a, b, c: (a + b + c) & MASK,
+    'bfi': lambda m, x, y: (m & x) | (~m & y & MASK),  # x where m is set, else y
 }
-COMMUTATIVE = {'add', 'xor', 'and'}
+COMMUTATIVE = {'add', 'xor', 'and', 'add3'}
 
 CONST, JOB, LANE, NONCE, VAR = range(5)
 KIND_NAME = ['const', 'job', 'lane', 'nonce', 'var']
@@ -80,15 +82,25 @@ LATENCY = {
     'avx512': dict(add=1, xor=1, _and=1, bsig0=2, bsig1=2, ssig0=2, ssig1=2, ch=1, maj=1),
     'avx2': dict(add=1, xor=1, _and=1, bsig0=4, bsig1=4, ssig0=4, ssig1=4, ch=3, maj=3),
     'scalar': dict(add=1, xor=1, _and=1, bsig0=2, bsig1=2, ssig0=2, ssig1=2, ch=2, maj=2),
+    # AMD RDNA (one work-item per lane): v_alignbit_b32 rotates, then v_xor3_b32.
+    'rdna': dict(add=1, add3=1, xor=1, _and=1, bfi=1, bsig0=2, bsig1=2, ssig0=2, ssig1=2, ch=1),
 }
 # Machine instructions per IR op, used only for the op-count report.
 COST = {
     'avx512': dict(add=1, xor=1, _and=1, bsig0=4, bsig1=4, ssig0=4, ssig1=4, ch=1, maj=1),
     'avx2': dict(add=1, xor=1, _and=1, bsig0=11, bsig1=11, ssig0=9, ssig1=9, ch=3, maj=3),
     'scalar': dict(add=1, xor=1, _and=1, bsig0=5, bsig1=5, ssig0=5, ssig1=5, ch=3, maj=3),
+    # Σ: 3x v_alignbit_b32 + v_xor3_b32; σ: 2x v_alignbit_b32 + v_lshrrev_b32 +
+    # v_xor3_b32; Ch and the second half of Maj: v_bfi_b32; sums: v_add3_u32.
+    'rdna': dict(add=1, add3=1, xor=1, _and=1, bfi=1, bsig0=4, bsig1=4, ssig0=4, ssig1=4, ch=1),
 }
 # Targets with a single instruction for Ch/Maj (vpternlogd).
 FUSED_TERNARY = {'avx512'}
+# Targets with a bit-field insert (v_bfi_b32) but no 3-input logic op: Ch is
+# one bfi, Maj is bfi(b ^ c, a, c). RDNA4 (gfx12) has no v_bitop3_b32.
+BFI_TARGETS = {'rdna'}
+# Targets with a 3-input add (v_add3_u32): per-lane sums become ternary trees.
+ADD3_TARGETS = {'rdna'}
 
 
 def opkey(name):
@@ -212,16 +224,19 @@ class Gen:
     def tree(self, atoms):
         heap = [(a.ready, a.id, a) for a in atoms]
         heapq.heapify(heap)
+        # With a 3-input add, an n-term sum takes ceil((n-1)/2) adds: one
+        # 2-input add first when n is even, then 3-input adds.
+        arity = 3 if self.target in ADD3_TARGETS else 2
         while len(heap) > 1:
-            x = heapq.heappop(heap)[2]
-            y = heapq.heappop(heap)[2]
-            s = self.op('add', x, y)
+            k = 2 if arity == 2 or len(heap) % 2 == 0 else 3
+            xs = [heapq.heappop(heap)[2] for _ in range(k)]
+            s = self.op('add' if k == 2 else 'add3', *xs)
             heapq.heappush(heap, (s.ready, s.id, s))
         return heap[0][2]
 
     # -- SHA-256 on the IR ------------------------------------------------
     def ch(self, e, f, g):
-        if self.target in FUSED_TERNARY:
+        if self.target in FUSED_TERNARY or self.target in BFI_TARGETS:
             return self.op('ch', e, f, g)
         e, f, g = self.mat(e), self.mat(f), self.mat(g)
         return self.op('xor', g, self.op('and', e, self.op('xor', f, g)))
@@ -230,6 +245,11 @@ class Gen:
         if self.target in FUSED_TERNARY:
             return self.op('maj', a, b, c)
         a, b, c = self.mat(a), self.mat(b), self.mat(c)
+        if self.target in BFI_TARGETS:
+            # Where b and c differ the majority is a, else c. (b ^ c) uses the
+            # two older state words, so it is uniform (precomputed) whenever
+            # they are, e.g. in the first rounds after a precomputed state.
+            return self.op('bfi', self.op('xor', b, c), a, c)
         # b ^ ((a ^ b) & (b ^ c)): (b ^ c) is last round's (a ^ b), shared by CSE.
         return self.op('xor', b, self.op('and', self.op('xor', a, b), self.op('xor', b, c)))
 
@@ -288,12 +308,14 @@ SCALAR_EXPR = {
     'bsig0': 'S_BSIG0({0})', 'bsig1': 'S_BSIG1({0})',
     'ssig0': 'S_SSIG0({0})', 'ssig1': 'S_SSIG1({0})',
     'ch': 'S_CH({0}, {1}, {2})', 'maj': 'S_MAJ({0}, {1}, {2})',
+    'add3': '({0} + {1} + {2})', 'bfi': 'S_BFI({0}, {1}, {2})',
 }
 VECTOR_EXPR = {
     'add': 'V_ADD({0}, {1})', 'xor': 'V_XOR({0}, {1})', 'and': 'V_AND({0}, {1})',
     'bsig0': 'V_BSIG0({0})', 'bsig1': 'V_BSIG1({0})',
     'ssig0': 'V_SSIG0({0})', 'ssig1': 'V_SSIG1({0})',
     'ch': 'V_CH({0}, {1}, {2})', 'maj': 'V_MAJ({0}, {1}, {2})',
+    'add3': 'V_ADD3({0}, {1}, {2})', 'bfi': 'V_BFI({0}, {1}, {2})',
 }
 INPUT_INDEX = dict({'mid%d' % i: i for i in range(8)}, w0=8, w1=9, w2=10)
 
@@ -435,7 +457,9 @@ def build_ablation(target, midstate, fold, early_exit, mode='nonce'):
             stack.extend(a.args)
     ops = [a for a in g.atoms if a.id in live and a.op not in ('input', 'const')]
     vec = sum(COST[target][opkey(a.op)] for a in ops if a.kind == VAR)
-    per_nonce = sum(COST['scalar'][opkey(a.op)] for a in ops if a.kind == NONCE)
+    # The shared schedule runs as scalar code on a CPU, as a pre-pass kernel on a GPU.
+    pre = COST['rdna' if target == 'rdna' else 'scalar']
+    per_nonce = sum(pre[opkey(a.op)] for a in ops if a.kind == NONCE)
     return vec, per_nonce
 
 
@@ -446,18 +470,23 @@ def ablation():
         ('+ midstate (T1): 2 compressions per nonce', True, False, False, 'nonce'),
         ('+ constant folding / precompute (T2, T3)', True, True, False, 'nonce'),
         ('+ early exit after round 60 of hash 2 (T4)', True, True, True, 'nonce'),
-        ('+ version rolling, 128 versions per nonce (T7)', True, True, True, 'vr'),
+        ('+ version rolling (T7): 128 versions per nonce on the CPU, all rolled versions '
+         'on the GPU', True, True, True, 'vr'),
     ]
-    for target, lanes in (('avx512', 16), ('avx2', 8)):
-        label = {'avx512': 'AVX-512', 'avx2': 'AVX2'}[target]
-        print('\n**%s (%d lanes)**, vector instructions per hash:\n' % (label, lanes))
+    for target, lanes in (('avx512', 16), ('avx2', 8), ('rdna', 1)):
+        label = {'avx512': 'AVX-512 (16 lanes)', 'avx2': 'AVX2 (8 lanes)',
+                 'rdna': 'AMD RDNA4 GPU (per work-item)'}[target]
+        print('\n**%s**, vector instructions per hash:\n' % label)
         print('| step | per hash | vs previous | total reduction |\n|---|---:|---:|---:|')
         first = prev = None
         for name, midstate, fold, early, mode in steps:
             vec, per_nonce = build_ablation(target, midstate, fold, early, mode)
             per_hash = vec / lanes
             note = ''
-            if per_nonce:
+            if per_nonce and lanes == 1:
+                note = (' (+%d VALU per nonce in a pre-pass kernel, shared by every version:'
+                        ' ~0 per hash)' % per_nonce)
+            elif per_nonce:
                 note = ' (+%.1f scalar per hash for the shared schedule)' % (per_nonce / 128)
             first = first or per_hash
             print('| %s | %.1f%s | %s | %s |' % (
@@ -473,7 +502,7 @@ def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else 'src/gen'
     os.makedirs(outdir, exist_ok=True)
     all_stats = []
-    for target in ('scalar', 'avx2', 'avx512'):
+    for target in ('scalar', 'avx2', 'avx512', 'rdna'):
         for mode in ('nonce', 'vr'):
             g, root = build(target, mode)
             prefix = 'g_%s_%s' % (target, mode)

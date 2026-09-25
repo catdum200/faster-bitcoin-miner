@@ -18,6 +18,8 @@
 #define S_SSIG1(x) (S_ROTR(x, 17) ^ S_ROTR(x, 19) ^ ((x) >> 10))
 #define S_CH(e, f, g) ((g) ^ ((e) & ((f) ^ (g))))
 #define S_MAJ(a, b, c) (((a) & (b)) | ((c) & ((a) | (b))))
+/* x where m is set, else y (AMD v_bfi_b32); the GPU target's Maj uses it. */
+#define S_BFI(m, x, y) ((y) ^ ((m) & ((x) ^ (y))))
 
 /* Generated-kernel inputs for one version of a job:
  * in[0..7] = midstate (state after the first 64 header bytes),

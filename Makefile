@@ -8,8 +8,9 @@ CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -pthread
 LDLIBS = -lcrypto -pthread
 
-SRC = main.c selftest.c miner.c kernels.c sha256.c header.c freq.c \
-      kernel_ref.c kernel_scalar.c kernel_avx2.c kernel_avx512.c kernel_avx512vl.c
+SRC = main.c stats.c selftest.c blocks.c miner.c kernels.c sha256.c header.c freq.c \
+      kernel_ref.c kernel_scalar.c kernel_rdna_emu.c kernel_avx2.c kernel_avx512.c \
+      kernel_avx512vl.c
 OBJ = $(SRC:%.c=build/%.o)
 GEN = $(wildcard src/gen/*.h)
 
@@ -42,7 +43,7 @@ build/cmo_simd_constants.o: $(CMO)/cpuminer-config.h | build
 	$(CC) -O3 -march=native -I$(CMO) -c -o $@ $(CMO)/simd-utils/simd-constants.c
 endif
 
-.PHONY: all gen test check asan tsan clean
+.PHONY: all gen test check asan tsan clean gpu gpu-test gpu-check
 
 all: fbm
 
@@ -50,7 +51,7 @@ fbm: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 build/%.o: src/%.c $(wildcard src/*.h) $(GEN) | build
-	$(CC) $(CFLAGS) $(ISA) -c -o $@ $<
+	$(CC) $(CFLAGS) $(ISA) $(INC) -c -o $@ $<
 
 build:
 	mkdir -p build
@@ -85,5 +86,37 @@ tsan:
 	./fbm test
 	$(MAKE) clean
 
+# GPU miner (OpenCL 1.2): `make gpu` builds fbm-gpu. It needs the OpenCL
+# headers and an ICD loader (Debian/Ubuntu: ocl-icd-opencl-dev; MSYS2:
+# mingw-w64-ucrt-x86_64-opencl-icd and -opencl-headers). The kernel sources are
+# embedded into the binary by tools/embed.c.
+GPU_CL = gpu/prelude.cl src/gen/g_rdna_nonce.h src/gen/g_rdna_vr.h gpu/kernels.cl
+GPU_OBJ = build/gpu_main.o build/gpu.o build/stats.o build/blocks.o build/sha256.o build/header.o
+OPENCL_LIBS ?= -lOpenCL
+
+gpu: fbm-gpu
+
+fbm-gpu: $(GPU_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(OPENCL_LIBS)
+
+build/embed: tools/embed.c | build
+	$(CC) -O2 -o $@ $<
+
+build/gpu_sources.h: build/embed $(GPU_CL)
+	build/embed fbm_gpu_src $(GPU_CL) > $@
+
+build/gpu.o: build/gpu_sources.h
+build/gpu.o: INC = -Ibuild
+
+# Runs the GPU tests on the first OpenCL device (a CPU OpenCL such as PoCL
+# works too: it checks the kernel source and the host, not GPU speed).
+gpu-test: fbm-gpu
+	./fbm-gpu test
+
+# Compiles the kernels for RDNA4 (gfx1200) with clang and audits the hot
+# loops against the generator's instruction counts.
+gpu-check:
+	python3 tools/gpu_isacheck.py
+
 clean:
-	rm -rf build fbm
+	rm -rf build fbm fbm-gpu

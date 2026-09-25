@@ -4,3 +4,5 @@ bench/cpuminer/cpuminer-bench
 bench/cpuminer/cpuminer-src/
 __pycache__/
 bench/cpuminer-opt/src/
+bench/gpu-baselines/src/
+fbm-gpu
