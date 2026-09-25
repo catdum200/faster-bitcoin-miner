@@ -59,7 +59,15 @@ SHIM = r'''
 '''
 
 
-def find_tools():
+def find_tools(need_clang=True):
+    if not need_clang:
+        for c in ('llvm-objdump', 'llvm-objdump-20', 'llvm-objdump-19', 'llvm-objdump-18'):
+            if shutil.which(c):
+                return None, shutil.which(c)
+        for v in ('20', '19', '18'):
+            if os.path.exists('/usr/lib/llvm-%s/bin/llvm-objdump' % v):
+                return None, '/usr/lib/llvm-%s/bin/llvm-objdump' % v
+        sys.exit('need llvm-objdump (LLVM 18 or newer) to disassemble the binary')
     for v in ('20', '19', '18', ''):
         clang = shutil.which('clang-' + v if v else 'clang')
         if not clang:
@@ -191,11 +199,14 @@ def row(name, hot, rare, nbytes, res, gen=None):
 def main():
     args = sys.argv[1:]
     mcpu = args[args.index('--mcpu') + 1] if '--mcpu' in args else 'gfx1200'
-    clang, objdump = find_tools()
+    clang, objdump = find_tools(need_clang='--binary' not in args)
     if '--binary' in args:
         path = args[args.index('--binary') + 1]
-        asm = subprocess.run([objdump, '-d', path], capture_output=True, text=True,
-                             check=True).stdout
+        r = subprocess.run([objdump, '-d', path], capture_output=True, text=True)
+        if r.returncode or '<fbm_' not in r.stdout:
+            sys.exit('%s: could not disassemble fbm kernels (not an AMDGPU code object?)\n%s'
+                     % (path, r.stderr[-500:]))
+        asm = r.stdout
         res = {}
         print('driver-compiled binary %s' % path)
     else:
