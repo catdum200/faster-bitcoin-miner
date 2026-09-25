@@ -21,7 +21,8 @@ ordered by estimated readiness (Huffman on ready time) to shorten dependency
 chains. The second hash stops as soon as H7 is known (e after round 60,
 0-indexed), and dead code is removed.
 
-Usage: gen_kernels.py OUTDIR   (writes one header per target/mode)
+Usage: gen_kernels.py OUTDIR       write one header per target/mode
+       gen_kernels.py --ablation   print per-technique instruction counts
 """
 import heapq
 import json
@@ -138,8 +139,8 @@ def add(*xs):
 
 
 class Gen:
-    def __init__(self, target, mode):
-        self.target, self.mode = target, mode
+    def __init__(self, target, mode, fold=True):
+        self.target, self.mode, self.fold = target, mode, fold
         self.lat = LATENCY[target]
         self.atoms, self.cse, self.consts = [], {}, {}
 
@@ -147,7 +148,9 @@ class Gen:
     def const(self, v):
         v &= MASK
         if v not in self.consts:
-            self.consts[v] = Atom(self, CONST, 'const', value=v)
+            # Without folding (ablation only), a constant is just another
+            # vector operand: nothing is precomputed or simplified.
+            self.consts[v] = Atom(self, CONST if self.fold else VAR, 'const', value=v)
         return self.consts[v]
 
     def input(self, name, kind):
@@ -400,7 +403,71 @@ def emit(g, root, prefix):
     return '\n'.join(out) + '\n', stats
 
 
+def build_ablation(target, midstate, fold, early_exit, mode='nonce'):
+    """The same computation with techniques switched off, for op counts."""
+    g = Gen(target, mode, fold=fold)
+    kind = (lambda k: k) if fold else (lambda k: VAR)
+    const = (lambda v: v) if fold else g.const
+    tail = [g.input('w%d' % i, kind(JOB)) for i in range(3)]
+    w3 = g.input('w3', kind(VAR if mode == 'nonce' else NONCE))
+    iv = [const(v) for v in IV]
+    if midstate:
+        mid = [g.input('mid%d' % i, kind(JOB if mode == 'nonce' else LANE)) for i in range(8)]
+    else:  # hash the first 64 header bytes again for every nonce
+        B = [g.input('b%d' % i, VAR) for i in range(16)]
+        g.expand(B, 64)
+        mid = [g.mat(add(v, s)) for v, s in zip(iv, g.rounds(iv, B, 0, 64))]
+    W = tail + [w3, const(0x80000000)] + [const(0)] * 10 + [const(0x280)]
+    g.expand(W, 64)
+    digest = [g.mat(add(m, s)) for m, s in zip(mid, g.rounds(mid, W, 0, 64))]
+    W2 = digest + [const(0x80000000)] + [const(0)] * 6 + [const(0x100)]
+    if early_exit:
+        g.expand(W2, 61)
+        roots = [g.mat(add(iv[7], g.rounds(iv, W2, 0, 61)[4]))]
+    else:
+        g.expand(W2, 64)
+        roots = [g.mat(add(v, s)) for v, s in zip(iv, g.rounds(iv, W2, 0, 64))]
+    live, stack = set(), list(roots)
+    while stack:
+        a = stack.pop()
+        if a.id not in live:
+            live.add(a.id)
+            stack.extend(a.args)
+    ops = [a for a in g.atoms if a.id in live and a.op not in ('input', 'const')]
+    vec = sum(COST[target][opkey(a.op)] for a in ops if a.kind == VAR)
+    per_nonce = sum(COST['scalar'][opkey(a.op)] for a in ops if a.kind == NONCE)
+    return vec, per_nonce
+
+
+def ablation():
+    """Deterministic per-technique instruction counts (no timing noise)."""
+    steps = [
+        ('naive: 3 compressions per nonce, nothing precomputed', False, False, False, 'nonce'),
+        ('+ midstate (T1): 2 compressions per nonce', True, False, False, 'nonce'),
+        ('+ constant folding / precompute (T2, T3)', True, True, False, 'nonce'),
+        ('+ early exit after round 60 of hash 2 (T4)', True, True, True, 'nonce'),
+        ('+ version rolling, 128 versions per nonce (T7)', True, True, True, 'vr'),
+    ]
+    for target, lanes in (('avx512', 16), ('avx2', 8)):
+        print('\n%s (%d lanes): vector instructions per hash' % (target, lanes))
+        print('| step | per hash | vs previous | vs naive |\n|---|---:|---:|---:|')
+        first = prev = None
+        for name, midstate, fold, early, mode in steps:
+            vec, per_nonce = build_ablation(target, midstate, fold, early, mode)
+            per_hash = vec / lanes
+            note = ''
+            if per_nonce:
+                note = ' (+%.1f scalar per hash for the shared schedule)' % (per_nonce / 128)
+            first = first or per_hash
+            print('| %s | %.1f%s | %s | %.2fx fewer |' % (
+                name, per_hash, note,
+                '%.1f%%' % (100 * (per_hash / prev - 1)) if prev else '-', first / per_hash))
+            prev = per_hash
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--ablation':
+        return ablation()
     outdir = sys.argv[1] if len(sys.argv) > 1 else 'src/gen'
     os.makedirs(outdir, exist_ok=True)
     all_stats = []

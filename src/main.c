@@ -23,9 +23,11 @@ static void usage(void)
             "      --seconds S per run (default 1)    --rounds R (default 20)\n"
             "      --baseline NAME (default cpuminer-opt16 if built, else ref)\n"
             "  fbm mine --header HEX80 [options] search for valid (version, nonce) pairs\n"
-            "      --kernel NAME (default: fastest)   --threads N (default: all CPUs)\n"
+            "      --kernel NAME (default: fastest for the version count)\n"
+            "      --threads N (default: all CPUs)\n"
             "      --start NONCE --count N (default: whole 2^32 range)\n"
-            "      --versions N (BIP 320 rolled versions, default 1)\n");
+            "      --versions N (BIP 320 rolled versions, default 1; 64+ selects\n"
+            "                    the version-rolling kernels)\n");
 }
 
 static const char *arg_value(int argc, char **argv, const char *name, const char *def)
